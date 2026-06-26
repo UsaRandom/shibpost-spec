@@ -1,0 +1,2 @@
+# shibpost-spec
+Shibpost Protocol
