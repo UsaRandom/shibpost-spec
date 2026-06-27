@@ -1,4 +1,4 @@
-# shibpost Protocol — Action State Machine
+# shibpost Protocol — Action State Machine (draft)
 
 This document defines the base layer of the shibpost protocol: an identity +
 engagement layer carried in Dogecoin `OP_RETURN` actions.
