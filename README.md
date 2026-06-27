@@ -32,10 +32,10 @@ layer (§5). The chain is the source of truth; clients only interpret (§5).
 - **The burn carries meaning only where the burned amount *is* the signal**, in three
   places: a **vote weight** (§3.8), name **rent** (CLAIM/RENEW, §3.4), and the market
   **reserve deposit** (RESERVE, §3.7). Everywhere else (COMMIT, TRANSFER, RELEASE, SELL,
-  SETTLE) the action's `OP_RETURN` carries **no required burn** — the Dogecoin **miner
+  SELLTO, SETTLE, PAY) the action's `OP_RETURN` carries **no required burn** — the Dogecoin **miner
   fee** is the only cost and is sufficient anti-spam. A market *payment* (the RESERVE
-  pay-leg and the SETTLE remainder, §3.7) rides in a **separate spendable output**, never
-  in the action `OP_RETURN`. The action `OP_RETURN` is provably unspendable and so is
+  pay-leg, the SETTLE remainder, and the directed PAY price, §3.7) rides in a **separate spendable
+  output**, never in the action `OP_RETURN`. The action `OP_RETURN` is provably unspendable and so is
   never dust-filtered (a value-bearing or zero-value `OP_RETURN` both relay and mine on
   Dogecoin); the dust limit binds only a *spendable* output — a buyer's market payment,
   §3.7 — never the action carrier.
@@ -80,6 +80,7 @@ retroactive; §3.9).
 | `MAX_LEASE` | `31_536_000` s (~365 d) | cap on how far ahead of now a lease may extend (§3.3) |
 | `COMMIT_EXPIRY` | `18_000` s (~5 h) | a commit's live window; self-prunes after (§3.2) |
 | `RESERVE_WINDOW` | `18_000` s (~5 h) | a reserve's exclusive-buy window; also the SELL window floor (§3.7) |
+| `DIRECT_WINDOW` | `7_200` s (~2 h) | the directed-sale (SELLTO) offer window — **fixed**, no field; the buyer's PAY deadline (§3.7) |
 | `REORG_BUFFER` | `7_200` s (~2 h) | margin keeping ordered time-boundaries apart with reorg slack (§3.7, §6) |
 | `RESERVE_DEPOSIT_BPS` | `100` (1.00 %) | total reserve deposit, basis points of `price` (§3.7) |
 | `RESERVE_BURN_BPS` | `50` (0.50 %) | deposit leg **burned** |
@@ -116,7 +117,7 @@ posts with no content heuristics.
 | 0 | `0xFF` | UTF-8 escape / action flag |
 | 1 | `0x53` | `'S'` |
 | 2 | `0x50` | `'P'` |
-| 3 | `[opcode]` | 1 byte, `0x01`–`0x0B` |
+| 3 | `[opcode]` | 1 byte, `0x01`–`0x0D` |
 
 **The carrier is a single, minimally-encoded push.** "The payload" — the bytes both the prefix
 test above and the UTF-8 demux below read — is defined as the data of a **lone data push**: the
@@ -176,10 +177,11 @@ plain post. `DECORATE` is gated forward-only at the same `ACTIVATION_HEIGHT` as 
 
 ## 2. The Action Registry
 
-Eleven opcodes in **two groups**. Genesis ops (`0x01`–`0x02`) are live from block 0; everything
-else (`0x03`–`0x0B`) — the names + market layer plus **`0x0B` DECORATE** (author-bound post
-metadata, §1) — switches on **atomically** at a single, publicly-announced `ACTIVATION_HEIGHT`
-(§3.0). Wire formats are summarized here and specified per-op below.
+Thirteen opcodes in **two groups**. Genesis ops (`0x01`–`0x02`) are live from block 0; everything
+else (`0x03`–`0x0D`) — the names + market layer (including the directed-sale pair **`0x0C` SELLTO /
+`0x0D` PAY**, §3.7) plus **`0x0B` DECORATE** (author-bound post metadata, §1) — switches on
+**atomically** at a single, publicly-announced `ACTIVATION_HEIGHT` (§3.0). Wire formats are
+summarized here and specified per-op below.
 
 | Opcode | Action | Payload | Value field |
 |--------|--------|---------|-------------|
@@ -196,6 +198,8 @@ metadata, §1) — switches on **atomically** at a single, publicly-announced `A
 | `0x09` | SETTLE | `name` (one per `OP_RETURN`) | — (payment is in outputs) |
 | `0x0A` | RELEASE | `anchor`(5) + `flags` | — (fee-only) |
 | `0x0B` | DECORATE | `[tag:1]+[len:2]+[value]` records | — (fee-only; directly precedes body, §1) |
+| `0x0C` | SELLTO | `price`(8) + `buyer`(20) + `name` | — (fee-only; directed offer, §3.7) |
+| `0x0D` | PAY | `name` (one per `OP_RETURN`) | — (payment is in outputs, §3.7) |
 
 ---
 
@@ -208,8 +212,9 @@ address and a vote is anonymous burn-weight, so neither races for a scarce names
 network bootstraps content and engagement before identity opens. Author self-deletion is
 the off-chain RETRACT (§3.8) — no genesis opcode.
 
-Everything else — COMMIT/CLAIM, RENEW, TRANSFER, RELEASE, the SELL/RESERVE/SETTLE
-market, and DECORATE — switches on **atomically** at a single, publicly-announced `ACTIVATION_HEIGHT`.
+Everything else — COMMIT/CLAIM, RENEW, TRANSFER, RELEASE, the open SELL/RESERVE/SETTLE and
+directed SELLTO/PAY market, and DECORATE — switches on **atomically** at a single,
+publicly-announced `ACTIVATION_HEIGHT`.
 Gating is **forward-only**: a gated action below the height is **dropped** and **never**
 retroactively applied. Folding the whole names layer into one gate makes commit–claim
 front-run protection mandatory from the first block any name can be claimed (§3.2). Because
@@ -249,9 +254,9 @@ name **lapses** for free when its lease ends — the zero-cost path when you don
 *when* it frees. **RELEASE (§3.6)** is the on-demand version: one fee-only tx returns
 selected names to the pool **immediately**, without waiting out a prepaid lease — freeing a
 long-prepaid name *now*, or selectively scrubbing gift-spam out of your owned set. There is
-no general "pending" state; a name **listed for sale** (§3.7) is the one *locked* state —
-still owned and **still renewable**, but frozen against TRANSFER/RELEASE/re-SELL until it
-settles or the listing ends.
+no general "pending" state; a name **listed for sale or under a directed offer** (§3.7) is the
+one *locked* state — still owned and **still renewable**, but frozen against
+TRANSFER/RELEASE/SELL/SELLTO until it settles, is paid, or the listing/offer ends.
 
 ### 3.2 Claiming — mandatory commit→claim (front-run protection)
 
@@ -448,14 +453,14 @@ where a name still goes unrenewed is `T < count` (funding below even one day per
 first `T` names **in ascending-lexicographic order** (the same ordering the bitmap and the
 remainder step use) get a day and the rest none.
 
-**Payment ops (RESERVE / SETTLE) are one name per `OP_RETURN`, batched at the *transaction*
+**Payment ops (RESERVE / SETTLE / PAY) are one name per `OP_RETURN`, batched at the *transaction*
 level.** Each carries exactly one listing (name length implicit from the `OP_RETURN`), and
-its amount is a fixed, indivisible per-name fraction of that name's listed price — nothing
-to water-fill. To act on several listings at once, place **several RESERVE/SETTLE
-`OP_RETURN`s in one transaction** (the same multi-`OP_RETURN` unlock the rest of the spec
-rides on, §0), and the money stays **individually split**: each listing's burn-leg is its
-own RESERVE `OP_RETURN` value, and each listing's pay-leg / settle-remainder is its own
-**exact-value output** to that seller — never summed. The count per tx is bounded only by
+its amount is a fixed, indivisible per-name fraction of that name's listed price (the whole
+price for PAY) — nothing to water-fill. To act on several listings at once, place **several
+RESERVE/SETTLE/PAY `OP_RETURN`s in one transaction** (the same multi-`OP_RETURN` unlock the rest
+of the spec rides on, §0), and the money stays **individually split**: each listing's burn-leg is
+its own RESERVE `OP_RETURN` value, and each listing's pay-leg / settle-remainder / PAY price is its
+own **exact-value output** to that seller — never summed. The count per tx is bounded only by
 transaction size and relay (today one `OP_RETURN`/tx; many once multi-`OP_RETURN` relay
 lands), **never by the protocol**.
 
@@ -470,7 +475,7 @@ listing's owed amount); the `vout`-order rule keeps it byte-identical across ind
 
 | op | selection |
 |----|-----------|
-| CLAIM / RESERVE / SETTLE | one `name` per `OP_RETURN` (batch >1 needs multi-`OP_RETURN`) |
+| CLAIM / RESERVE / SETTLE / SELLTO / PAY | one `name` per `OP_RETURN` (batch >1 needs multi-`OP_RETURN`) |
 | RENEW / RELEASE | **bitmap** over your owned-set (which the indexer already tracks) |
 | TRANSFER | bitmap over owned-set → one target |
 
@@ -497,11 +502,12 @@ RENEW selective  [0xFF SP 0x05][anchor:5][flags:1..71]   = 10..80 B   ~568 names
   out-of-bounds bit can never erroneously release or transfer a name (there is no name at that
   index), so the anchor guard, not the bounds rule, is what protects the destructive ops.
 - The **5-byte absolute height anchor `H`** pins the bitmap's meaning. A per-owner
-  `last_set_mutation_height` is bumped on any CLAIM/TRANSFER/RELEASE/SETTLE/lapse touching the
-  set **or its ordering**, for *either* party (SETTLE both adds to the buyer's set and removes
-  from the seller's, so it bumps **both**). A SELL **listing** is deliberately **not** a
-  mutation: the name stays in the seller's owned set (still renewable, §3.7), keeping its
-  bitmap position, so a live RENEW bitmap spanning a listing is unaffected. Selective renew is
+  `last_set_mutation_height` is bumped on any CLAIM/TRANSFER/RELEASE/SETTLE/PAY/lapse touching the
+  set **or its ordering**, for *either* party (SETTLE and PAY both add to the buyer's set and
+  remove from the seller's, so they bump **both**). A SELL **listing** or a SELLTO **offer** is
+  deliberately **not** a mutation: the name stays in the seller's owned set (still renewable,
+  §3.7), keeping its bitmap position, so a live RENEW bitmap spanning a listing or offer is
+  unaffected. Selective renew is
   valid **iff** `last_mutation ≤ H ≤ confirm_height` and `confirm_height − H ≤ MAX_ANCHOR_AGE`.
   If the set has not mutated since `H`, the live lexicographic ordering equals the snapshot
   ordering, so the bits are exact. Worst case under a race is a safe **reject-and-resend**,
@@ -548,13 +554,13 @@ Selected names return to the claimable pool **immediately** at this tx's positio
 burned, exactly as on a lapse). A released name is **immediately reclaimable** by a new
 COMMIT/CLAIM, identical to a lapse (§6); a reclaim a later reorg reverses is dropped on
 replay, the same client-side reorg risk as any fresh claim (§3.2). RELEASE touches only names
-you **own and are not currently listing** — a name listed for sale (§3.7) is locked (still
-owned and renewable, but frozen against RELEASE/TRANSFER/re-SELL until it settles or the
-listing ends). There is deliberately **no release-all** mode ("abandon everything" is what
+you **own and are neither listing nor offering** — a name listed for sale or under a directed
+offer (§3.7) is locked (still owned and renewable, but frozen against RELEASE/TRANSFER/SELL/SELLTO
+until it settles, is paid, or the listing/offer ends). There is deliberately **no release-all** mode ("abandon everything" is what
 lapse already does for free); RELEASE is the *selective, now* tool (~568 names/tx), and the
 wrong-name footgun is caught by the anchor guard.
 
-### 3.7 The names market — SELL, RESERVE, SETTLE
+### 3.7 The names market — open (SELL · RESERVE · SETTLE) & directed (SELLTO · PAY)
 
 Paid sales are **fixed-price and escrow-first**. The flow:
 
@@ -565,11 +571,12 @@ SELL(name, price, window) ──▶ [off-chain discovery / negotiation / auction
 The two design pillars:
 
 - **Escrow-first** — SELL **locks** the name: while listed it cannot be TRANSFERred,
-  RELEASEd, or re-SOLD, so the seller can't move it out from under a buyer. (The name stays in
-  the seller's owned set and **stays renewable** — keeping the lease alive only benefits the
-  eventual buyer; only *movement* is frozen.) This closes the co-sign-swap front-run: a seller
-  can't grant the name in a co-signed tx and simultaneously transfer it away using a different
-  UTXO, because TRANSFER on a listed name is **rejected** for the listing's life.
+  RELEASEd, re-SOLD, or SELLTO-offered, so the seller can't move it out from under a buyer. (The
+  name stays in the seller's owned set and **stays renewable** — keeping the lease alive only
+  benefits the eventual buyer; only *movement* is frozen.) This closes the co-sign-swap front-run:
+  a seller can't grant the name in a co-signed tx and simultaneously transfer it away using a
+  different UTXO, because TRANSFER on a listed name is **rejected** for the listing's life. (A
+  directed SELLTO offer locks the name identically — see *Directed sales* below.)
 - **Fixed price** — the price is committed on-chain at SELL, immutable. This closes the
   dynamic-price front-run: with nothing to infer at reserve time, a seller can't self-reserve
   at a cheap inferred price. The escrow is what makes publishing a fixed price safe (without
@@ -577,9 +584,10 @@ The two design pillars:
   escrowed).
 
 **SELL (`0x07`).** Payload: `price` (8, ≥ `3 × DUST_FLOOR`) + `window` (4, seconds) + `name`.
-Requires the sender **own** `name`, that it not already be listed, and that
+Requires the sender **own** `name`, that it be neither already listed nor under a directed offer
+(§3.7 *Directed sales*), and that
 `price ≥ 3 × DUST_FLOOR` — a SELL below the floor is **ignored**. Lists it (locking it from
-TRANSFER/RELEASE/re-SELL per the escrow-first pillar) at the fixed `price`; records
+TRANSFER/RELEASE/re-SELL/SELLTO per the escrow-first pillar) at the fixed `price`; records
 `{seller (hash160 + script type, §4 Rule 2), price, offer_expiry = MTP_now + window}`. The
 lease conveys at settle. Fee-only. **There is no cancel op, but a listing is reclaimable:** a
 seller pulls a name back out of escrow by buying its own listing (self-RESERVE + self-SETTLE) —
@@ -671,6 +679,90 @@ Every payment output is an **exact** match, so matching is unambiguous and reuse
 The only genuinely *open* item is reserve-griefing — bounded and priced. Clients MUST disclose
 both deposit legs as non-refundable and that a contested reserve can forfeit them.
 
+#### Directed sales — SELLTO & PAY (the directed dual)
+
+The open flow above *finds* a buyer; a **directed** sale *delivers* to a buyer you already have
+(an OTC deal discovered off-chain, §5). Naming the buyer on-chain makes the sale **exclusive by
+construction**, so the directed flow needs **no deposit, no option race, and no griefing margin** —
+it is structurally simpler than the open market:
+
+```
+SELLTO(name, price, buyer) ──▶ [buyer pays within DIRECT_WINDOW] ──▶ PAY(name)
+```
+
+Both pillars carry over unchanged — **escrow-first** (a SELLTO'd name is movement-locked, identical
+to a SELL listing) and **fixed price** (committed on-chain at SELLTO). What drops away is the
+*third* open-market mechanism: the deposit/option machinery that resolves contention among open
+reservers simply isn't needed, because only the named `buyer` can ever complete the sale.
+
+**SELLTO (`0x0C`).** Payload: `price` (8, ≥ `DUST_FLOOR`) + `buyer` (20, hash160) + `name`.
+Requires the sender **own** `name`, that it be neither already listed (SELL) nor already offered
+(SELLTO), and that it have at least `DIRECT_WINDOW + REORG_BUFFER` of lease left. Records
+`{buyer, price, seller (hash160 + script type, §4 Rule 2), offer_expiry = MTP_now + DIRECT_WINDOW}`
+and **locks** the name exactly as SELL does — frozen against TRANSFER/RELEASE/SELL/SELLTO for the
+offer's life, but **still owned and still renewable** (the lease conveys to the buyer at PAY, so
+keeping it alive only helps them). Like a SELL listing, a SELLTO offer is **not** a set mutation
+(§3.5) — the name keeps its bitmap position. Fee-only; the price rides in the buyer's PAY, never
+here. `DIRECT_WINDOW` is **fixed** (no `window` field), so the lease-tail requirement guarantees
+`offer_expiry ≤ lease_expiry − REORG_BUFFER` and the name can never lapse while an offer is live.
+
+There is **no cancel and no self-reclaim.** Unlike SELL — where the seller self-buys to pull a name
+back out of escrow — only the *named buyer* can complete a directed offer, so the seller cannot
+exercise it to reclaim. The sole exit is the short self-expiry; this is why `DIRECT_WINDOW` is held
+to ~2 h, so a stale offer frees the name quickly. A seller with no agreed counterparty SHOULD use
+the open SELL flow instead — emit a SELLTO only against a buyer who is ready.
+
+**PAY (`0x0D`).** Payload: a single `name` — one offer per `OP_RETURN` (pay several at once via
+several PAY `OP_RETURN`s in one tx, §3.5). **No burn.** The buyer pays the full `price` to the
+seller in **its own exact-value output** (matched per the `vout`-order consume-once rule of §3.5)
+and claims the name; the lease conveys. Honored **iff** all hold: a **live** SELLTO for `name`
+exists; this PAY's `vin[0]` Identity (§4) **equals** the offer's `buyer` (the directed exclusivity —
+no other address can complete it, at any fee); `MTP < offer_expiry`; and the matching exact-value
+output to the seller's recorded `(hash160, script type)` is present. On success the name moves to
+the buyer's owned set and **both** parties' `last_set_mutation_height` bump (§3.5), exactly as
+SETTLE. There is no deposit and no `price × bps` split, so the buyer's outlay is exactly `price` in
+one tx and RESERVE's deposit-overflow concern does not arise. The `buyer` may be a P2SH hash, so a
+directed sale to a community keyset (communities-spec §1) works with no extra machinery — `buyer`
+is a bare hash160 compared against the PAYer's §4 Identity, never reconstructed.
+
+A PAY whose buyer, price-output, name, or timing fails to match a live offer is **dropped** — but
+its payment output is a *real* spend that still pays the seller; the indexer has no custody to
+refund, exactly as for a late SETTLE. Paying **early, with margin** before `offer_expiry` is the
+buyer's job; `DIRECT_WINDOW` is sized to dominate confirmation depth + MTP lag (~5–6 blocks) +
+reorg slack, so a promptly-broadcast PAY is safe — a window much shorter would be a footgun, which
+is why ~2 h reads as a **floor on usefulness**, not merely the cap you'd choose for liquidity.
+Clients **MUST** warn that a PAY is irreversible and gate it on the SELLTO being confirmed and well
+inside its window.
+
+**No burn — and what that implies.** The open market's ~0.5 % `burn_leg` was option-collateral (it
+priced the open RESERVE race), never a protocol rake; a directed sale has no option to
+collateralize, so it burns nothing and the seller nets the full `price`. SELLTO+PAY is therefore
+the **low-cost settlement rail for any deal already discovered off-chain** (§5) — the common
+"we already agreed" case — leaving the deposit-protected open flow for genuine public price
+discovery and auctions. Expect directed settlement to dominate; the open flow earns its extra
+complexity only when there is no specific buyer yet.
+
+**Offer spam (the one new surface).** A SELLTO names a `buyer` but puts **nothing** into their
+owned set — it is a pure advisory the buyer's client *may* surface, filtered by the same
+web-of-trust rules as reactions and DMs (§5); an offer from an un-followed address is bucketed or
+hidden. On chain it is bounded exactly like a SELL listing — **one live offer per owned name**,
+self-shedding at `offer_expiry` (≤ `DIRECT_WINDOW`) — so it is **not** an index-bloat vector. The
+economic floor (a miner fee plus a *rented* name locked for the window) is the gift-spam bound of
+§3.6 minus the give-away, and the harm is strictly less (nothing lands on the victim). **No new
+anti-spam constant is required** — deliberately no burn on SELLTO, since the WoT display filter
+already nullifies the harm and a burn would break the fee-only symmetry with SELL.
+
+**Security properties (directed flow).**
+
+| attack | status | mechanism |
+|---|---|---|
+| buyer-snipe by a stranger | **closed by construction** | only the named `buyer`'s `vin[0]` can PAY — exclusivity with no deposit or race |
+| co-sign-swap front-run (seller moves the name away) | **closed** | escrow-first — a SELLTO'd name is movement-locked, identical to a SELL listing |
+| dynamic-price front-run | **closed** | fixed price committed at SELLTO; nothing to infer at PAY time |
+| offer spam (SELLTO at a victim address) | **bounded, benign** | nothing enters the victim's set; one lock per owned name, self-shedding ≤ `DIRECT_WINDOW`; WoT-filtered at display |
+| late PAY (pay for a closed/expired offer) | **client timing** | `MTP < offer_expiry` gate + a `DIRECT_WINDOW` sized over confirmation/MTP-lag/reorg; pay early, as for SETTLE |
+| seller can't cancel early | **accepted** | no cancel/self-reclaim verb — the short self-expiry is the only exit; emit only against an agreed buyer |
+
 ### 3.8 Engagement — votes; author self-deletion is off-chain RETRACT
 
 **VOTE_UP (`0x01`) / VOTE_DOWN (`0x02`).** Anonymous (no name needed — only an attributable
@@ -714,7 +806,7 @@ the index.**
 
 | class | determines | gate |
 |---|---|---|
-| identity (CLAIM/RENEW/TRANSFER/RELEASE) + market (SELL/RESERVE/SETTLE) | the global namespace + ownership | **protocol constants** (rate, windows, priority) |
+| identity (CLAIM/RENEW/TRANSFER/RELEASE) + market (SELL/RESERVE/SETTLE, SELLTO/PAY) | the global namespace + ownership | **protocol constants** (rate, windows, priority) |
 | votes | a subjective per-user view | **client policy** (min-burn, web-of-trust) |
 | author self-deletion (RETRACT) + moderation | a subjective per-view signal | **off-chain, client policy** (handle-signed, opt-in; §3.8, §5) |
 
@@ -792,7 +884,7 @@ self-compare), so a name gifted/sold to a P2SH hash is owned and renewable immed
 byte in the wire format. The one derived fact the fold retains (§6), deterministic and shed-able:
 
 - **Script type per party.** Every site that later *reconstructs* a controller's script — the
-  SELL `seller` payment check (§3.7), a SETTLE writing the new owner-hash — records the
+  SELL/SELLTO `seller` payment check, a SETTLE/PAY writing the new owner-hash (§3.7) — records the
   **(hash160, script type)**, P2PKH **or** P2SH; the rule is *"reconstruct per recorded type,"*
   never "assume P2PKH." (Paying a P2SH seller needs only its `hash160`, so the keyset preimage is
   **never** cached on-chain.) The recorded type is a **template selector** (P2PKH
@@ -914,9 +1006,10 @@ client-side §5 filtering:
   re-validation.
 - **Reactions** — handle-signed, TTL'd gossip.
 - **The names orderbook** — asks, bids, and auctions are advisory gossip; the chain only *settles*
-  a price gossip discovered (§3.7). Clients can run arbitrarily rich markets here; only the final
-  SELL/RESERVE/SETTLE touch the chain. Clients **MUST NOT** surface or originate a
-  SELL/RESERVE/SETTLE whose spendable outputs (the `pay_leg` or settle remainder, §3.7) fall below
+  a price gossip discovered (§3.7), via either the open SELL/RESERVE/SETTLE flow or a directed
+  SELLTO/PAY. Clients can run arbitrarily rich markets here; only the final settlement touches the
+  chain. Clients **MUST NOT** surface or originate a SELL/RESERVE/SETTLE/SELLTO/PAY whose spendable
+  outputs (the `pay_leg`, settle remainder, or directed PAY `price`, §3.7) fall below
   the host network's current **relay/dust** policy — such a tx will not relay, so the listing is
   un-executable. The protocol stays agnostic to the (mutable, off-chain) dust limit; the
   deterministic fold honors any such action that is nonetheless mined.
@@ -934,10 +1027,10 @@ JSON-RPC array position). The scan extends the existing `valid_utf8()` demux:
 for each OP_RETURN output o in tx (vout order):       # vout order = intra-tx state-machine order
     payload = the_single_minimal_push(o)              # exactly ONE minimal push, else ⊥ (§1)
     if payload is ⊥:                                        ignore   # multi-push / non-minimal / trailing opcode
-    elif payload starts with 0xFF 'S' 'P' + opcode in 0x01..0x0B:   # contiguous; no reserved holes
+    elif payload starts with 0xFF 'S' 'P' + opcode in 0x01..0x0D:   # contiguous; no reserved holes
         run §4 stateless verification on vin[0]              # P2PKH O(1) or P2SH multisig O(m)
         if not verified: drop; continue
-        if opcode in 0x03..0x0B and height < ACTIVATION_HEIGHT: drop; continue   # forward-only gate (§3.0)
+        if opcode in 0x03..0x0D and height < ACTIVATION_HEIGHT: drop; continue   # forward-only gate (§3.0)
         for burn-bearing ops (VOTE/CLAIM/RENEW/RESERVE): check the value field meets the op's requirement
         dispatch by opcode against current fold state                       # mutates owned set / escrow
         # CLAIM: mints iff name unowned AND a live matching commit in a STRICTLY EARLIER block (commit_height < claim_height, §3.2) sets commit_height — else drop (no FCFS fallback); burn buys ⌊value·LEASE_QUANTUM/(rate·BILLING_UNIT)⌋ days of lease
@@ -945,6 +1038,8 @@ for each OP_RETURN output o in tx (vout order):       # vout order = intra-tx st
         # RELEASE: selected owned names → pool immediately; immediately reclaimable, like lapse (§3.6)
         # SELL/RESERVE/SETTLE: one name per OP_RETURN (several per tx via multi-OP_RETURN, §3.5); each payment its own exact-value output, consumed once in vout order
         # RESERVE: two-leg deposit spent unconditionally; first-in-chain-order wins the SETTLE option, reserve_expiry = min(now+RESERVE_WINDOW, offer_expiry) (§3.7)
+        # SELLTO: directed offer → lock name (like SELL), record buyer + price + offer_expiry = now+DIRECT_WINDOW; not a set mutation (§3.7)
+        # PAY: honored iff live SELLTO for name AND vin[0]==buyer AND MTP<offer_expiry AND exact-value price→seller present; name→buyer, lease conveys, bump both; no burn (§3.7)
         # DECORATE: split into [tag][len:2][value] records (fail-closed on overrun); BUFFER as pending — they bind to the NEXT body below (§1)
     elif o.value > 0 and len(payload) >= 1 and valid_utf8(payload):  text post — author = §4(vin[0]) or ANONYMOUS; bind pending DECORATE records to it iff that author owns ≥1 name here (§4.1), then clear the buffer
     else:                                                       ignore
@@ -954,7 +1049,9 @@ for each OP_RETURN output o in tx (vout order):       # vout order = intra-tx st
 **Tables.** `votes` (per `(target, vout)`; voter + burn; foldable to a per-post `(Σ up, Σ down)`
 past finality). `names` (the owned-set store — a row per `(name, owner)` with `lease_expiry`, and
 — for a **listed** name — a `listed` flag plus `price`, `seller` (hash160 + script type),
-`offer_expiry`, and reservation fields `reserver`, `reserve_expiry`). `commits` (per
+`offer_expiry`, and reservation fields `reserver`, `reserve_expiry`; a **directed-offered** name
+instead carries an `offered` flag plus `buyer`, `price`, `seller` (hash160 + script type), and
+`offer_expiry` — no reservation fields, since the named buyer is the only completer). `commits` (per
 `{commitment, commit_height, tx_index}`, pruned at `COMMIT_EXPIRY`). Per-owner
 `last_set_mutation_height` for the renew anchor guard (§3.5). `post_decorations` (records bound to a post's `(txid, vout)`,
 stored **verbatim** and served, never interpreted, §1). There is **no** `purged` table —
@@ -962,12 +1059,16 @@ author self-deletion is the off-chain RETRACT (§3.8).
 
 **Time-triggered transitions (no transaction).** Apply as the fold crosses the MTP boundary,
 **before** that block's transactions: a name lapses to the pool at `lease_expiry`; an unsettled
-listing closes at `offer_expiry` (clears the listed flag — the name was always the seller's,
-§3.7); a lapsed (unsettled) reserve reverts the listing to the open offer at `reserve_expiry`.
+open listing closes at `offer_expiry` (clears the `listed` flag — the name was always the seller's,
+§3.7); an unpaid **directed offer** (SELLTO) closes at its own `offer_expiry` (clears the `offered`
+flag — likewise always the seller's); a lapsed (unsettled) reserve reverts the open listing to its
+pre-reserve state at `reserve_expiry`.
 Because `reserve_expiry` is **clamped to `offer_expiry`** at RESERVE (§3.7), these nest strictly
 — `reserve_expiry ≤ offer_expiry ≤ lease_expiry − REORG_BUFFER < lease_expiry` — so MTP
 monotonicity crosses them in order regardless of reorgs (the `REORG_BUFFER` gap is a *relative*
 margin between two MTP-evaluated boundaries, matching the chain's own ±2h timestamp bound). A
+**directed** offer has only the two-level nest `offer_expiry ≤ lease_expiry − REORG_BUFFER` (no
+reserve layer) — a strict sub-case of the same ordering, so its close needs no special handling. A
 name freed by lapse **or by RELEASE (§3.6)** leaves its owner at once and is **immediately
 reclaimable**; a reclaim a later reorg reverses is dropped on replay — no protocol-level cooling
 window, reorg-risk on a reclaim is client-side, exactly as for any fresh claim (§3.2).
@@ -976,8 +1077,8 @@ window, reorg-risk on a reclaim is client-side, exactly as for any fresh claim (
 that height **before** the block's transactions; then process txs in `(tx index, vout)` order,
 each change visible to everything after it — a **single forward pass**. When one MTP advance
 crosses several boundaries at once, apply the transitions **by type in this order — `reserve_expiry`
-(revert reserve → open offer), then `offer_expiry` (close listing), then `lease_expiry` (lapse to
-pool)** — and make each transition idempotent (guarded on current state). Ordering by *type* (not
+(revert reserve → open offer), then `offer_expiry` (close open listing or directed offer), then
+`lease_expiry` (lapse to pool)** — and make each transition idempotent (guarded on current state). Ordering by *type* (not
 by sorting boundary values) is required because the values can tie — the RESERVE clamp permits
 `reserve_expiry == offer_expiry` — and it is the order in which each transition's precondition
 already holds. This ordering matters only **within a single name's** reserve→offer→lease chain;
@@ -1024,7 +1125,11 @@ floor per-block division, the **odd**-`FEE_WINDOW` single-element median, the ex
 pinned to `median(timestamp[H−11 .. H−1])` (a boundary call that flips under an off-by-one window);
 the **DECORATE** binding (TLV framing fail-closed on overrun; records bound to the next body in
 `vout` order; the §4.1 name-ownership gate dropping a nameless author's records; orphan-drop at
-tx-end); and lease conveyance on TRANSFER/SETTLE. An indexer conforms iff it passes **both** the §4
+tx-end); the **directed sale** (SELLTO locking the name and not bumping the mutation height; a PAY
+from a non-`buyer` `vin[0]` dropping while its exact-value output still pays the seller; a correct
+PAY conveying the name + lease and bumping both sets; a directed `offer_expiry` close clearing an
+unpaid offer; the `DIRECT_WINDOW`+`REORG_BUFFER` lease-tail bound at SELLTO); and lease conveyance
+on TRANSFER/SETTLE/PAY. An indexer conforms iff it passes **both** the §4
 and these fold vectors.
 
 The subprotocol sync messages (`getpostidx` / `getposts`, see network-roadmap.md) carry these op
@@ -1046,6 +1151,8 @@ types too, not just text posts.
 | SETTLE | 4 + len(name) ≤ 24 | ✅ (one per `OP_RETURN`; several per tx via multi-`OP_RETURN`) |
 | RELEASE | 9 + len(flags) ≤ 80 | ✅ (~568 names/tx) |
 | DECORATE | 4 + Σ records ≤ 80 | ✅ (`[tag][len:2][value]` records; several carriers per tx) |
+| SELLTO | 32 + len(name) ≤ 52 | ✅ (`price`(8) + `buyer`(20) + `name`; fixed window, no field) |
+| PAY | 4 + len(name) ≤ 24 | ✅ (one per `OP_RETURN`; several per tx via multi-`OP_RETURN`) |
 
 This budget is the **`OP_RETURN` payload only**, unchanged by P2SH: a multisig `vin[0]`'s
 redeemScript and its `k` signatures ride in the **`scriptSig`** (its own size/relay budget), so
@@ -1060,7 +1167,7 @@ The denomination of every duration follows **what it measures** (§0):
 
 | quantity | denominated in | why |
 |---|---|---|
-| leases, `COMMIT_EXPIRY`, SELL/`RESERVE_WINDOW` | **time (MTP)** | wall-clock commitments; survive a block-speed change |
+| leases, `COMMIT_EXPIRY`, SELL/`RESERVE_WINDOW`, `DIRECT_WINDOW` | **time (MTP)** | wall-clock commitments; survive a block-speed change |
 | `REORG_BUFFER` (window margins) | **time (MTP), ~2 h** | a *relative* gap MTP monotonicity keeps ordered; matches the chain's ±2h timestamp bound |
 | priority `(claim_height, commit_height, tx_index)` | **height** | ordering is positional |
 | renewal/transfer bitmap anchor, `MAX_ANCHOR_AGE` | **height** | it bounds a height |
