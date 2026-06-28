@@ -32,7 +32,7 @@ layer (§5). The chain is the source of truth; clients only interpret (§5).
 - **The burn carries meaning only where the burned amount *is* the signal**, in three
   places: a **vote weight** (§3.8), name **rent** (CLAIM/RENEW, §3.4), and the market
   **reserve deposit** (RESERVE, §3.7). Everywhere else (COMMIT, TRANSFER, RELEASE, SELL,
-  SELLTO, SETTLE, PAY) the action's `OP_RETURN` carries **no required burn** — the Dogecoin **miner
+  SELL_TO, SETTLE, PAY, AS, TRADE) the action's `OP_RETURN` carries **no required burn** — the Dogecoin **miner
   fee** is the only cost and is sufficient anti-spam. A market *payment* (the RESERVE
   pay-leg, the SETTLE remainder, and the directed PAY price, §3.7) rides in a **separate spendable
   output**, never in the action `OP_RETURN`. The action `OP_RETURN` is provably unspendable and so is
@@ -80,7 +80,7 @@ retroactive; §3.9).
 | `MAX_LEASE` | `31_536_000` s (~365 d) | cap on how far ahead of now a lease may extend (§3.3) |
 | `COMMIT_EXPIRY` | `18_000` s (~5 h) | a commit's live window; self-prunes after (§3.2) |
 | `RESERVE_WINDOW` | `18_000` s (~5 h) | a reserve's exclusive-buy window; also the SELL window floor (§3.7) |
-| `DIRECT_WINDOW` | `7_200` s (~2 h) | the directed-sale (SELLTO) offer window — **fixed**, no field; the buyer's PAY deadline (§3.7) |
+| `DIRECT_WINDOW` | `7_200` s (~2 h) | the directed-sale (SELL_TO) offer window — **fixed**, no field; the buyer's PAY deadline (§3.7) |
 | `REORG_BUFFER` | `7_200` s (~2 h) | margin keeping ordered time-boundaries apart with reorg slack (§3.7, §6) |
 | `RESERVE_DEPOSIT_BPS` | `100` (1.00 %) | total reserve deposit, basis points of `price` (§3.7) |
 | `RESERVE_BURN_BPS` | `50` (0.50 %) | deposit leg **burned** |
@@ -117,7 +117,7 @@ posts with no content heuristics.
 | 0 | `0xFF` | UTF-8 escape / action flag |
 | 1 | `0x53` | `'S'` |
 | 2 | `0x50` | `'P'` |
-| 3 | `[opcode]` | 1 byte, `0x01`–`0x0D` |
+| 3 | `[opcode]` | 1 byte, `0x01`–`0x0F` |
 
 **The carrier is a single, minimally-encoded push.** "The payload" — the bytes both the prefix
 test above and the UTF-8 demux below read — is defined as the data of a **lone data push**: the
@@ -171,15 +171,16 @@ as votes and reactions). A decoration-unaware reader just sees the plain body; d
 ever *add* (graceful degradation). As anti-spam, a decorated post is honored only if its author
 **owns ≥1 name** at the post's confirmation height — otherwise its records drop and it renders as a
 plain post. `DECORATE` is gated forward-only at the same `ACTIVATION_HEIGHT` as the names layer
-(§3.0). Full treatment: **communities-spec.md §4** (consolidated) and post-decorations.md.
+(§3.0).
 
 ---
 
 ## 2. The Action Registry
 
-Thirteen opcodes in **two groups**. Genesis ops (`0x01`–`0x02`) are live from block 0; everything
-else (`0x03`–`0x0D`) — the names + market layer (including the directed-sale pair **`0x0C` SELLTO /
-`0x0D` PAY**, §3.7) plus **`0x0B` DECORATE** (author-bound post metadata, §1) — switches on
+Fifteen opcodes in **two groups**. Genesis ops (`0x01`–`0x02`) are live from block 0; everything
+else (`0x03`–`0x0F`) — the names + market layer (the directed-sale pair **`0x0C` SELL_TO / `0x0D`
+PAY**, §3.7), the multi-identity pair **`0x0E` AS / `0x0F` TRADE** (custodial batching + atomic
+1-1 name swap, §3.10), plus **`0x0B` DECORATE** (author-bound post metadata, §1) — switches on
 **atomically** at a single, publicly-announced `ACTIVATION_HEIGHT` (§3.0). Wire formats are
 summarized here and specified per-op below.
 
@@ -198,8 +199,10 @@ summarized here and specified per-op below.
 | `0x09` | SETTLE | `name` (one per `OP_RETURN`) | — (payment is in outputs) |
 | `0x0A` | RELEASE | `anchor`(5) + `flags` | — (fee-only) |
 | `0x0B` | DECORATE | `[tag:1]+[len:2]+[value]` records | — (fee-only; directly precedes body, §1) |
-| `0x0C` | SELLTO | `price`(8) + `buyer`(20) + `name` | — (fee-only; directed offer, §3.7) |
+| `0x0C` | SELL_TO | `price`(8) + `buyer`(20) + `name` | — (fee-only; directed offer, §3.7) |
 | `0x0D` | PAY | `name` (one per `OP_RETURN`) | — (payment is in outputs, §3.7) |
+| `0x0E` | AS | `[index:1]` | — (fee-only; sets acting identity to vin[index], §3.10) |
+| `0x0F` | TRADE | `[idxA:1][idxB:1]` + `nameA,nameB` | — (fee-only; atomic 1-1 name swap, §3.10) |
 
 ---
 
@@ -213,8 +216,8 @@ network bootstraps content and engagement before identity opens. Author self-del
 the off-chain RETRACT (§3.8) — no genesis opcode.
 
 Everything else — COMMIT/CLAIM, RENEW, TRANSFER, RELEASE, the open SELL/RESERVE/SETTLE and
-directed SELLTO/PAY market, and DECORATE — switches on **atomically** at a single,
-publicly-announced `ACTIVATION_HEIGHT`.
+directed SELL_TO/PAY market, the AS/TRADE multi-identity layer, and DECORATE — switches on
+**atomically** at a single, publicly-announced `ACTIVATION_HEIGHT`.
 Gating is **forward-only**: a gated action below the height is **dropped** and **never**
 retroactively applied. Folding the whole names layer into one gate makes commit–claim
 front-run protection mandatory from the first block any name can be claimed (§3.2). Because
@@ -256,7 +259,7 @@ selected names to the pool **immediately**, without waiting out a prepaid lease 
 long-prepaid name *now*, or selectively scrubbing gift-spam out of your owned set. There is
 no general "pending" state; a name **listed for sale or under a directed offer** (§3.7) is the
 one *locked* state — still owned and **still renewable**, but frozen against
-TRANSFER/RELEASE/SELL/SELLTO until it settles, is paid, or the listing/offer ends.
+TRANSFER/RELEASE/SELL/SELL_TO until it settles, is paid, or the listing/offer ends.
 
 ### 3.2 Claiming — mandatory commit→claim (front-run protection)
 
@@ -444,7 +447,11 @@ be applied *fully*, never wasted:
 3. **Water-fill:** raise a uniform level `λ` (each name takes `min(hᵢ, λ)` days); a name that
    caps drops out and its share flows to the rest, until `T` is spent or every name caps. Any
    integer remainder after the even level goes `+1` **day** to the first headroom-having names
-   in ascending-lexicographic order; each name's `lease_expiry += add × BILLING_UNIT`.
+   in ascending-lexicographic order; each name's `lease_expiry += add × BILLING_UNIT`. If
+   **every** targeted name reaches its `MAX_LEASE` ceiling while `T > 0` still remains, the
+   unallocated remainder is **forfeited** — the burn was already destroyed in the unspendable
+   `OP_RETURN`, so nothing is carried forward or refunded (every indexer computes the identical
+   capped allocation, so there is nothing to disagree on).
 
 So a fee spike neither drops names nor wastes coin: it buys a shorter, evenly-shorter lease
 across the whole batch, and a name that would over-shoot `MAX_LEASE` redirects its rent to
@@ -475,9 +482,10 @@ listing's owed amount); the `vout`-order rule keeps it byte-identical across ind
 
 | op | selection |
 |----|-----------|
-| CLAIM / RESERVE / SETTLE / SELLTO / PAY | one `name` per `OP_RETURN` (batch >1 needs multi-`OP_RETURN`) |
+| CLAIM / RESERVE / SETTLE / SELL_TO / PAY | one `name` per `OP_RETURN` (batch >1 needs multi-`OP_RETURN`) |
 | RENEW / RELEASE | **bitmap** over your owned-set (which the indexer already tracks) |
 | TRANSFER | bitmap over owned-set → one target |
+| TRADE | one `name` from each party, swapped atomically (§3.10) |
 
 #### RENEW wire format (the pinned form)
 
@@ -502,9 +510,10 @@ RENEW selective  [0xFF SP 0x05][anchor:5][flags:1..71]   = 10..80 B   ~568 names
   out-of-bounds bit can never erroneously release or transfer a name (there is no name at that
   index), so the anchor guard, not the bounds rule, is what protects the destructive ops.
 - The **5-byte absolute height anchor `H`** pins the bitmap's meaning. A per-owner
-  `last_set_mutation_height` is bumped on any CLAIM/TRANSFER/RELEASE/SETTLE/PAY/lapse touching the
-  set **or its ordering**, for *either* party (SETTLE and PAY both add to the buyer's set and
-  remove from the seller's, so they bump **both**). A SELL **listing** or a SELLTO **offer** is
+  `last_set_mutation_height` is bumped on any CLAIM/TRANSFER/RELEASE/SETTLE/PAY/TRADE/lapse touching
+  the set **or its ordering**, for *either* party (SETTLE and PAY both add to the buyer's set and
+  remove from the seller's, and a TRADE moves names both ways between its two parties, so they bump
+  **both**). A SELL **listing** or a SELL_TO **offer** is
   deliberately **not** a mutation: the name stays in the seller's owned set (still renewable,
   §3.7), keeping its bitmap position, so a live RENEW bitmap spanning a listing or offer is
   unaffected. Selective renew is
@@ -555,12 +564,12 @@ burned, exactly as on a lapse). A released name is **immediately reclaimable** b
 COMMIT/CLAIM, identical to a lapse (§6); a reclaim a later reorg reverses is dropped on
 replay, the same client-side reorg risk as any fresh claim (§3.2). RELEASE touches only names
 you **own and are neither listing nor offering** — a name listed for sale or under a directed
-offer (§3.7) is locked (still owned and renewable, but frozen against RELEASE/TRANSFER/SELL/SELLTO
+offer (§3.7) is locked (still owned and renewable, but frozen against RELEASE/TRANSFER/SELL/SELL_TO
 until it settles, is paid, or the listing/offer ends). There is deliberately **no release-all** mode ("abandon everything" is what
 lapse already does for free); RELEASE is the *selective, now* tool (~568 names/tx), and the
 wrong-name footgun is caught by the anchor guard.
 
-### 3.7 The names market — open (SELL · RESERVE · SETTLE) & directed (SELLTO · PAY)
+### 3.7 The names market — open (SELL · RESERVE · SETTLE) & directed (SELL_TO · PAY)
 
 Paid sales are **fixed-price and escrow-first**. The flow:
 
@@ -571,12 +580,12 @@ SELL(name, price, window) ──▶ [off-chain discovery / negotiation / auction
 The two design pillars:
 
 - **Escrow-first** — SELL **locks** the name: while listed it cannot be TRANSFERred,
-  RELEASEd, re-SOLD, or SELLTO-offered, so the seller can't move it out from under a buyer. (The
+  RELEASEd, re-SOLD, or SELL_TO-offered, so the seller can't move it out from under a buyer. (The
   name stays in the seller's owned set and **stays renewable** — keeping the lease alive only
   benefits the eventual buyer; only *movement* is frozen.) This closes the co-sign-swap front-run:
   a seller can't grant the name in a co-signed tx and simultaneously transfer it away using a
   different UTXO, because TRANSFER on a listed name is **rejected** for the listing's life. (A
-  directed SELLTO offer locks the name identically — see *Directed sales* below.)
+  directed SELL_TO offer locks the name identically — see *Directed sales* below.)
 - **Fixed price** — the price is committed on-chain at SELL, immutable. This closes the
   dynamic-price front-run: with nothing to infer at reserve time, a seller can't self-reserve
   at a cheap inferred price. The escrow is what makes publishing a fixed price safe (without
@@ -587,7 +596,7 @@ The two design pillars:
 Requires the sender **own** `name`, that it be neither already listed nor under a directed offer
 (§3.7 *Directed sales*), and that
 `price ≥ 3 × DUST_FLOOR` — a SELL below the floor is **ignored**. Lists it (locking it from
-TRANSFER/RELEASE/re-SELL/SELLTO per the escrow-first pillar) at the fixed `price`; records
+TRANSFER/RELEASE/re-SELL/SELL_TO per the escrow-first pillar) at the fixed `price`; records
 `{seller (hash160 + script type, §4 Rule 2), price, offer_expiry = MTP_now + window}`. The
 lease conveys at settle. Fee-only. **There is no cancel op, but a listing is reclaimable:** a
 seller pulls a name back out of escrow by buying its own listing (self-RESERVE + self-SETTLE) —
@@ -600,10 +609,15 @@ dies to puppet addresses). This only pays off on an **underpriced** listing (a f
 seller just fills the sale), so it acts as built-in misprice-correction, not a hole (clients
 warn, §5).
 
-- `window` is bounded `RESERVE_WINDOW ≤ window ≤ (lease_expiry − MTP_now) − REORG_BUFFER`; a
-  name is listable iff it has at least `RESERVE_WINDOW + REORG_BUFFER` of lease left. The upper
-  bound pins `offer_expiry ≤ lease_expiry − REORG_BUFFER`, so the name can never lapse to the
-  pool while a sale is live (the "pay for an already-free name" trap is structurally
+- `window` is bounded below by `RESERVE_WINDOW` and above by the lease tail, the upper bound
+  evaluated in **add-form** — `window ≥ RESERVE_WINDOW` **and** `MTP_now + window + REORG_BUFFER
+  ≤ lease_expiry` (all unsigned additions, ≥64-bit), **never** the subtraction
+  `(lease_expiry − MTP_now) − REORG_BUFFER`, which would **underflow and wrap** to a near-`2³²`
+  value for a short-tailed name and pass the check (the same unsigned-subtraction trap §3.4 pins
+  for the fee oracle; the add-form has no negative intermediate). Equivalently, a name is
+  listable iff it has at least `RESERVE_WINDOW + REORG_BUFFER` of lease left. This pins
+  `offer_expiry = MTP_now + window ≤ lease_expiry − REORG_BUFFER`, so the name can never lapse to
+  the pool while a sale is live (the "pay for an already-free name" trap is structurally
   impossible, with reorg slack). `window = 0` defaults to `RESERVE_WINDOW`; out of range →
   ignored.
 - A listing's `price` is fixed koinu and cannot be repriced in place; to re-price, the seller
@@ -679,7 +693,7 @@ Every payment output is an **exact** match, so matching is unambiguous and reuse
 The only genuinely *open* item is reserve-griefing — bounded and priced. Clients MUST disclose
 both deposit legs as non-refundable and that a contested reserve can forfeit them.
 
-#### Directed sales — SELLTO & PAY (the directed dual)
+#### Directed sales — SELL_TO & PAY (the directed dual)
 
 The open flow above *finds* a buyer; a **directed** sale *delivers* to a buyer you already have
 (an OTC deal discovered off-chain, §5). Naming the buyer on-chain makes the sale **exclusive by
@@ -687,21 +701,21 @@ construction**, so the directed flow needs **no deposit, no option race, and no 
 it is structurally simpler than the open market:
 
 ```
-SELLTO(name, price, buyer) ──▶ [buyer pays within DIRECT_WINDOW] ──▶ PAY(name)
+SELL_TO(name, price, buyer) ──▶ [buyer pays within DIRECT_WINDOW] ──▶ PAY(name)
 ```
 
-Both pillars carry over unchanged — **escrow-first** (a SELLTO'd name is movement-locked, identical
-to a SELL listing) and **fixed price** (committed on-chain at SELLTO). What drops away is the
+Both pillars carry over unchanged — **escrow-first** (a SELL_TO'd name is movement-locked, identical
+to a SELL listing) and **fixed price** (committed on-chain at SELL_TO). What drops away is the
 *third* open-market mechanism: the deposit/option machinery that resolves contention among open
 reservers simply isn't needed, because only the named `buyer` can ever complete the sale.
 
-**SELLTO (`0x0C`).** Payload: `price` (8, ≥ `DUST_FLOOR`) + `buyer` (20, hash160) + `name`.
+**SELL_TO (`0x0C`).** Payload: `price` (8, ≥ `DUST_FLOOR`) + `buyer` (20, hash160) + `name`.
 Requires the sender **own** `name`, that it be neither already listed (SELL) nor already offered
-(SELLTO), and that it have at least `DIRECT_WINDOW + REORG_BUFFER` of lease left. Records
+(SELL_TO), and that it have at least `DIRECT_WINDOW + REORG_BUFFER` of lease left. Records
 `{buyer, price, seller (hash160 + script type, §4 Rule 2), offer_expiry = MTP_now + DIRECT_WINDOW}`
-and **locks** the name exactly as SELL does — frozen against TRANSFER/RELEASE/SELL/SELLTO for the
+and **locks** the name exactly as SELL does — frozen against TRANSFER/RELEASE/SELL/SELL_TO for the
 offer's life, but **still owned and still renewable** (the lease conveys to the buyer at PAY, so
-keeping it alive only helps them). Like a SELL listing, a SELLTO offer is **not** a set mutation
+keeping it alive only helps them). Like a SELL listing, a SELL_TO offer is **not** a set mutation
 (§3.5) — the name keeps its bitmap position. Fee-only; the price rides in the buyer's PAY, never
 here. `DIRECT_WINDOW` is **fixed** (no `window` field), so the lease-tail requirement guarantees
 `offer_expiry ≤ lease_expiry − REORG_BUFFER` and the name can never lapse while an offer is live.
@@ -710,19 +724,19 @@ There is **no cancel and no self-reclaim.** Unlike SELL — where the seller sel
 back out of escrow — only the *named buyer* can complete a directed offer, so the seller cannot
 exercise it to reclaim. The sole exit is the short self-expiry; this is why `DIRECT_WINDOW` is held
 to ~2 h, so a stale offer frees the name quickly. A seller with no agreed counterparty SHOULD use
-the open SELL flow instead — emit a SELLTO only against a buyer who is ready.
+the open SELL flow instead — emit a SELL_TO only against a buyer who is ready.
 
 **PAY (`0x0D`).** Payload: a single `name` — one offer per `OP_RETURN` (pay several at once via
 several PAY `OP_RETURN`s in one tx, §3.5). **No burn.** The buyer pays the full `price` to the
 seller in **its own exact-value output** (matched per the `vout`-order consume-once rule of §3.5)
-and claims the name; the lease conveys. Honored **iff** all hold: a **live** SELLTO for `name`
+and claims the name; the lease conveys. Honored **iff** all hold: a **live** SELL_TO for `name`
 exists; this PAY's `vin[0]` Identity (§4) **equals** the offer's `buyer` (the directed exclusivity —
 no other address can complete it, at any fee); `MTP < offer_expiry`; and the matching exact-value
 output to the seller's recorded `(hash160, script type)` is present. On success the name moves to
 the buyer's owned set and **both** parties' `last_set_mutation_height` bump (§3.5), exactly as
 SETTLE. There is no deposit and no `price × bps` split, so the buyer's outlay is exactly `price` in
 one tx and RESERVE's deposit-overflow concern does not arise. The `buyer` may be a P2SH hash, so a
-directed sale to a community keyset (communities-spec §1) works with no extra machinery — `buyer`
+directed sale to a community keyset works with no extra machinery — `buyer`
 is a bare hash160 compared against the PAYer's §4 Identity, never reconstructed.
 
 A PAY whose buyer, price-output, name, or timing fails to match a live offer is **dropped** — but
@@ -731,25 +745,25 @@ refund, exactly as for a late SETTLE. Paying **early, with margin** before `offe
 buyer's job; `DIRECT_WINDOW` is sized to dominate confirmation depth + MTP lag (~5–6 blocks) +
 reorg slack, so a promptly-broadcast PAY is safe — a window much shorter would be a footgun, which
 is why ~2 h reads as a **floor on usefulness**, not merely the cap you'd choose for liquidity.
-Clients **MUST** warn that a PAY is irreversible and gate it on the SELLTO being confirmed and well
+Clients **MUST** warn that a PAY is irreversible and gate it on the SELL_TO being confirmed and well
 inside its window.
 
 **No burn — and what that implies.** The open market's ~0.5 % `burn_leg` was option-collateral (it
 priced the open RESERVE race), never a protocol rake; a directed sale has no option to
-collateralize, so it burns nothing and the seller nets the full `price`. SELLTO+PAY is therefore
+collateralize, so it burns nothing and the seller nets the full `price`. SELL_TO+PAY is therefore
 the **low-cost settlement rail for any deal already discovered off-chain** (§5) — the common
 "we already agreed" case — leaving the deposit-protected open flow for genuine public price
 discovery and auctions. Expect directed settlement to dominate; the open flow earns its extra
 complexity only when there is no specific buyer yet.
 
-**Offer spam (the one new surface).** A SELLTO names a `buyer` but puts **nothing** into their
+**Offer spam (the one new surface).** A SELL_TO names a `buyer` but puts **nothing** into their
 owned set — it is a pure advisory the buyer's client *may* surface, filtered by the same
 web-of-trust rules as reactions and DMs (§5); an offer from an un-followed address is bucketed or
 hidden. On chain it is bounded exactly like a SELL listing — **one live offer per owned name**,
 self-shedding at `offer_expiry` (≤ `DIRECT_WINDOW`) — so it is **not** an index-bloat vector. The
 economic floor (a miner fee plus a *rented* name locked for the window) is the gift-spam bound of
 §3.6 minus the give-away, and the harm is strictly less (nothing lands on the victim). **No new
-anti-spam constant is required** — deliberately no burn on SELLTO, since the WoT display filter
+anti-spam constant is required** — deliberately no burn on SELL_TO, since the WoT display filter
 already nullifies the harm and a burn would break the fee-only symmetry with SELL.
 
 **Security properties (directed flow).**
@@ -757,9 +771,9 @@ already nullifies the harm and a burn would break the fee-only symmetry with SEL
 | attack | status | mechanism |
 |---|---|---|
 | buyer-snipe by a stranger | **closed by construction** | only the named `buyer`'s `vin[0]` can PAY — exclusivity with no deposit or race |
-| co-sign-swap front-run (seller moves the name away) | **closed** | escrow-first — a SELLTO'd name is movement-locked, identical to a SELL listing |
-| dynamic-price front-run | **closed** | fixed price committed at SELLTO; nothing to infer at PAY time |
-| offer spam (SELLTO at a victim address) | **bounded, benign** | nothing enters the victim's set; one lock per owned name, self-shedding ≤ `DIRECT_WINDOW`; WoT-filtered at display |
+| co-sign-swap front-run (seller moves the name away) | **closed** | escrow-first — a SELL_TO'd name is movement-locked, identical to a SELL listing |
+| dynamic-price front-run | **closed** | fixed price committed at SELL_TO; nothing to infer at PAY time |
+| offer spam (SELL_TO at a victim address) | **bounded, benign** | nothing enters the victim's set; one lock per owned name, self-shedding ≤ `DIRECT_WINDOW`; WoT-filtered at display |
 | late PAY (pay for a closed/expired offer) | **client timing** | `MTP < offer_expiry` gate + a `DIRECT_WINDOW` sized over confirmation/MTP-lag/reorg; pay early, as for SETTLE |
 | seller can't cancel early | **accepted** | no cancel/self-reclaim verb — the short self-expiry is the only exit; emit only against an agreed buyer |
 
@@ -779,21 +793,25 @@ per-post `(Σ up, Σ down)` aggregate (score-identical; loses per-voter WoT deta
 
 **Author self-deletion is off-chain — RETRACT.** There is **no on-chain self-delete opcode**.
 Author self-deletion is the degenerate moderation verb where the signer **is** the post's §4
-author; it lives in the off-chain handle-signed mesh (§5) with the same trust check and zero
-chain bytes:
+author; it lives in the off-chain mesh (§5) with the same trust check and zero chain bytes, signed
+with the **canonical off-chain envelope (§5)** — never a bare raw-hash sign, so any standard wallet
+can author it:
 
 ```
-retract = { author_addr(20) ‖ author_pubkey(33) ‖ target_txid(32) ‖ target_vout(4) ‖ issued_at }
-msg_id  = SHA256(retract);   sig = ECDSA(author_priv, msg_id)
-honor iff hash160(author_pubkey) == author_addr ∧ sig valid ∧ author_addr == target's §4 vin[0] author
+retract body = "shibpost/v1\nretract\n" ‖ hex(target_txid) ‖ "\n" ‖ target_vout ‖ "\n" ‖ issued_at
+sig          = §5-envelope signature over `body` by the post's §4 author
+               (P2PKH: one BIP-137 recoverable sig; P2SH-multisig: m keyset sigs + redeemScript, §4 Rule 2)
+honor iff the envelope's resolved identity (recovered hash160, or hash160(redeemScript))
+          == target's recorded §4 vin[0] author
 ```
 
-A post's `vin[0]` author is recorded at index time (§4); that recorded hash is what a RETRACT
-is checked against. Anonymous posts are **non-retractable** (no §4 key; clients SHOULD offer to
-hide unattributable posts). The client-local tombstone is keyed
-`(target_txid, target_vout, author_addr)` and **re-validated on every re-sync**, so a
-retraction whose target a reorg later un-indexes stops hiding the now-different outpoint. (Full
-social-layer treatment — moderation lenses, revocation convergence — in communities-spec §3.)
+A post's `vin[0]` author is recorded at index time (§4); that recorded identity — P2PKH **or**
+P2SH-multisig — is what a RETRACT is checked against, so a **community-authored** post is retracted
+by an n-of-m envelope from the same keyset (a single key cannot). Anonymous posts are
+**non-retractable** (no §4 identity; clients SHOULD offer to hide unattributable posts). The
+client-local tombstone is keyed `(target_txid, target_vout, author_addr)` and **re-validated on
+every re-sync**, so a retraction whose target a reorg later un-indexes stops hiding the
+now-different outpoint.
 
 **Reactions are off-chain** — handle-signed gossip (§5), with the same web-of-trust filtering
 as everything social; a ~4-byte social signal does not justify permanent chain data.
@@ -806,7 +824,7 @@ the index.**
 
 | class | determines | gate |
 |---|---|---|
-| identity (CLAIM/RENEW/TRANSFER/RELEASE) + market (SELL/RESERVE/SETTLE, SELLTO/PAY) | the global namespace + ownership | **protocol constants** (rate, windows, priority) |
+| identity (CLAIM/RENEW/TRANSFER/RELEASE/TRADE) + market (SELL/RESERVE/SETTLE, SELL_TO/PAY) + attribution (AS) | the global namespace + ownership | **protocol constants** (rate, windows, priority) |
 | votes | a subjective per-user view | **client policy** (min-burn, web-of-trust) |
 | author self-deletion (RETRACT) + moderation | a subjective per-view signal | **off-chain, client policy** (handle-signed, opt-in; §3.8, §5) |
 
@@ -829,6 +847,103 @@ re-centralizing) — which is why the *rent* is derived from the coinbase rather
 A below `H`, rule B at/after. Replay stays single-valued; the change is **forward-only, never
 retroactive**.
 
+### 3.10 Multi-identity transactions — AS (batching) & TRADE (barter)
+
+By default a transaction speaks with a single voice: every action is attributed to `vin[0]`
+(§4 Rule 1). Two opcodes lift that — **`AS`** lets one tx carry actions from *several* co-signers
+(custodial batching), and **`TRADE`** atomically exchanges holdings between two of them (barter).
+Both are **flat settlement verbs** — they add attribution and atomicity, never computation; a tx
+that uses neither behaves exactly as before, so this is a pure superset.
+
+**`AS` (`0x0E`) — the acting identity.** Payload: `index` (1 byte). An `AS k` carrier re-points the
+**acting identity** to `vin[k]` for every subsequent action-carrier in the tx, until the next `AS`
+or end-of-tx; before any `AS` the acting identity is `vin[0]`, and it resets each tx. The named
+input is verified by the *same* §4 algorithm (Rule 1b) — attribution stays stateless and O(1) per
+distinct named input. `AS` re-points **attribution only, never burn-accounting**: every
+burn-bearing action's cost is its **own carrier's `OP_RETURN` value** (destroyed regardless of
+which input funded the tx), so `AS` changes *who an action is credited to*, not *where the koinu came
+from*. Fee-only.
+
+- **You can only act *as* an identity that co-signed.** Every input an `AS` names MUST sign exactly
+  `SIGHASH_ALL` (Rule 3), which commits it to the whole input order and every output — hence to all
+  `AS` markers and actions. So by signing, `vin[k]` authorizes precisely the segment attributed to
+  it; an attacker can neither relocate it nor attach an action it didn't sign, and no index that did
+  not sign can be named. Impersonation is impossible by construction.
+- **Use.** A custodian batches *M* users' votes/posts/renews into one tx, each `AS`-segmented to its
+  owner — the headline fee-saver, and the thing one tx cannot do today (today all *M* attribute to
+  the custodian). Sponsored/gasless actions fall out: a sponsor's inputs fund the burns, the user's
+  dust input merely proves identity. Attribution is to a real address, so a user's history/names
+  travel if they later self-custody.
+- **The footgun — co-signing stops being innocent.** Today a pure funding input is never attributed
+  anything; under `AS`, signing `SIGHASH_ALL` consents to whatever an `AS` marker pins on your
+  input. Not a protocol hole (you signed the whole tx), but **wallets MUST display, per input, the
+  actions it will author before signing**.
+- **Composition & failure.** `AS` flushes the pending DECORATE buffer (a post and its decorations
+  share one author, §1). An `AS k` out of range, or whose `vin[k]` fails §4 (incl. not
+  `SIGHASH_ALL`), yields no valid identity → its segment's actions **drop** (a bare post →
+  **anonymous**). An orphan `AS` (nothing after) is a no-op; a re-`AS` simply re-sets the mode —
+  there is no "conflicting author" case.
+
+**`TRADE` (`0x0F`) — atomic 1-1 name swap.** Payload: `[idxA:1][idxB:1]` then `nameA,nameB` — the
+two names as a **comma-separated pair**. After the two index bytes the rest of the payload is split
+on the single `,` (`0x2C`); because the name charset `[a-z0-9_]` (§3.1) never contains a comma the
+separator is unambiguous and **no length byte is needed**. The payload MUST hold **exactly one** `,`
+with both sides valid per §3.1 — no comma, a comma inside a name, or an empty side → **drop**.
+`vin[idxA]` and `vin[idxB]` are the two parties; each name is a **literal string**, exactly how
+SELL/SELL_TO/RESERVE/SETTLE/PAY name a single name (a 1-1 swap is a single-name op, not a batch — so
+**no bitmap and no anchor**). Effect, **atomic**: `nameA` (owned by `vin[idxA]`) → `vin[idxB]` and
+`nameB` (owned by `vin[idxB]`) → `vin[idxA]`, leases convey (§3.6). It is **one opcode**, so it
+applies in full or **drops in full** — there is no partial or one-sided trade. Both parties MUST
+pass §4 + sign `SIGHASH_ALL`; it bumps **both** parties' `last_set_mutation_height` (§3.5), so any
+RENEW/RELEASE/TRANSFER bitmap either party has in flight registers the moved name. Fee-only.
+
+- **Atomicity *and* anti-rug come free from the live-ownership re-check.** Validity is re-evaluated
+  at the swap's **confirmation** position in the fold (§6): `vin[idxA]` must **still own `nameA`**
+  and `vin[idxB]` must **still own `nameB`**, both **unlocked** (neither listed nor offered, §3.7).
+  If either party moved, released, sold, locked, or let lapse the name they pledged after signing —
+  by an earlier tx in the same block or any prior one — they no longer own it unlocked at confirm,
+  so **the whole TRADE drops** and the counterparty keeps what they had. A party can neither tamper
+  and still pass (the check is against live state, not a snapshot) nor extract a one-sided outcome
+  (one opcode, all-or-nothing). The only outcomes are {full swap} or {nothing}. This is exactly the
+  live-ownership gate SETTLE and PAY already use — no anchor, and no `last_mutation` comparison for
+  the swap itself.
+- **Batches at the tx level:** several `TRADE` `OP_RETURN`s in one tx, each a 1-1 swap over its own
+  input pair, settle independently-atomically (a custodial book of trades) — the same
+  multi-`OP_RETURN` unlock the rest of the spec rides on (§0), never several swaps in one carrier.
+- **Fail-closed edges (each drops the whole op):** an index out of range; `idxA == idxB`; either
+  input failing §4/`SIGHASH_ALL`; `vin[idxA]` not owning `nameA`, or `vin[idxB]` not owning `nameB`,
+  at confirm; either name **locked** (listed/offered, §3.7); `nameA == nameB` (one name cannot sit
+  on both sides — and two distinct parties cannot both own a name anyway); the payload not holding
+  **exactly one** `,` separator, or either side failing name validation (§3.1, which also bounds
+  length 1..20). The two names are distinct and owned by different parties, so the sides never
+  collide.
+- **Boundaries (deliberate).** Pure **name-for-name** — stapling a cash leg reopens the rug (a raw
+  payment output is not ownership-gated with the swap, so it would pay even if the TRADE dropped);
+  cash-balanced deals stay in the market lane (SELL_TO/PAY, §3.7). **1-for-1, 2-party only** —
+  multi-name or N-party barter is a non-goal (batch several TRADEs, or fall back to TRANSFER).
+  Discovery/liquidity (asks/bids/wants) stays **off-chain** (§5); TRADE is the settlement rail, not
+  a barter market. **Wallets MUST render the fully-resolved both-sides preview** ("you give
+  `nameA`, you get `nameB`") before signing — an irreversible asset swap.
+
+**Wallet previews are a conformance artifact, not just prose.** `AS` and `TRADE` route irreversible
+asset/fund outcomes through what a wallet shows *before* signing — `AS`'s per-input attribution
+(Rule 1b) and `TRADE`'s give/get. The spec therefore pins those renderings with a shipped
+**preview-vector set** — `raw tx → {per-input attribution; for each TRADE the exact (give, get) per
+party}` — alongside the §6 fold vectors. The protocol cannot *force* a wallet to display correctly,
+but it makes "correct" mechanically checkable: a wallet conforms iff its rendering matches the
+preview vectors. The fold itself is safe-by-construction; this closes the one safety-relevant layer
+otherwise left to prose.
+
+**Why this is the ceiling (a recorded non-goal).** `AS` adds attribution and `TRADE` adds atomic
+exchange — together they bring the `OP_RETURN` layer up to plain Bitcoin-transaction expressiveness
+(multiple signers, all-or-nothing) and **stop there on purpose**. The line: **every opcode encodes a
+*settlement fact*** — who owns what, paid to whom, atomically — **never a *computation*** — a value
+derived by branching or looping. A deterministic fold with no loops and no data-dependent control
+flow is a finite state machine, not a virtual machine, and the 80-byte carrier + statelessness +
+O(1)-per-action rule keep it that way by construction. Logic lives in the client — *the chain
+settles; gossip discovers* (§5). Litmus for any future opcode: *is this a fact the chain settles, or
+a result it computes?* The former may be considered; the latter belongs to gossip.
+
 ---
 
 ## 4. Stateless Identity & Attribution (O(1) Verification)
@@ -845,6 +960,24 @@ other inputs are funding only. This applies to **text posts** too: a post's auth
 **anonymous** content — no address, not retractable. Attribution is **never** lifted from an
 unverified `scriptSig` pubkey.
 
+**Rule 1b — the acting identity & the `AS` marker (§3.10).** By default the acting identity is
+`vin[0]` (Rule 1). An **`AS k`** carrier (`0x0E`) re-points it to `vin[k]` for every subsequent
+action-carrier until the next `AS` or end-of-tx; the default before any `AS` is `vin[0]`, and it
+resets per tx. `vin[k]` is verified by running this **same §4 algorithm on `vin[k]`** instead of
+`vin[0]` — stateless, and O(1) per *distinct* named input (memoize: an input's identity is fixed no
+matter how many segments name it). **Every input an `AS` names MUST satisfy Rule 3** (sign exactly
+`SIGHASH_ALL`): that signature commits it to the entire input order and every output — hence to all
+`AS` markers and actions — so by signing, `vin[k]` authorizes exactly the segment attributed to it,
+an attacker can neither relocate it nor attach an unsigned action, and no input that did not sign
+can be named. **You can only act *as* an identity that co-signed the exact tx; impersonation is
+impossible.** An `AS k` that is out of range or whose `vin[k]` fails §4 (including not `SIGHASH_ALL`)
+yields no valid identity → its segment's actions **drop** (a bare post → **anonymous**). Everywhere
+this spec names the actor as `vin[0]` — the post author, the CLAIM minter, the SELL/SELL_TO
+`seller`, the PAY `buyer` check, the RETRACT author, a TRADE party — read it as **the acting
+identity**: `vin[0]` by default, or the `AS`-named input within that segment. **Wallet
+(normative):** because co-signing now implies consent to whatever an `AS` attributes to your input,
+wallets MUST display, per input, the actions it will author before signing.
+
 **Rule 2 — P2PKH and P2SH multisig are attributable (day-1, full).** Identity is recovered by
 classifying `vin[0]`'s `scriptSig` shape (the prevout `scriptPubKey` is not available) — a fixed
 exact algorithm over **two** recognized shapes; everything else (P2PK, bare multisig,
@@ -855,7 +988,7 @@ nonstandard, empty) → **drop**:
   redeemScript's threshold; a different count → drop), the redeemScript (last data push) exactly
   `OP_m <33-B compressed pubkey>×n OP_n OP_CHECKMULTISIG`; `Identity = hash160(redeemScript)` (the
   bare script-hash, type-tracked below); **O(m)** ECDSA verifies. This lets a name — a community —
-  be **owned by, and post/vote as**, an n-of-m group (communities-spec §1), with the threshold
+  be **owned by, and post/vote as**, an n-of-m group, with the threshold
   enforced natively by the spend.
 
 Neither shape needs a general script interpreter: P2PKH is two pushes + one verify;
@@ -884,7 +1017,7 @@ self-compare), so a name gifted/sold to a P2SH hash is owned and renewable immed
 byte in the wire format. The one derived fact the fold retains (§6), deterministic and shed-able:
 
 - **Script type per party.** Every site that later *reconstructs* a controller's script — the
-  SELL/SELLTO `seller` payment check, a SETTLE/PAY writing the new owner-hash (§3.7) — records the
+  SELL/SELL_TO `seller` payment check, a SETTLE/PAY writing the new owner-hash (§3.7) — records the
   **(hash160, script type)**, P2PKH **or** P2SH; the rule is *"reconstruct per recorded type,"*
   never "assume P2PKH." (Paying a P2SH seller needs only its `hash160`, so the keyset preimage is
   **never** cached on-chain.) The recorded type is a **template selector** (P2PKH
@@ -901,14 +1034,16 @@ the new keyset's P2SH), and **official posts/votes** — is the native **n-of-m*
 already enforces. (Renewal needs quorum like everything else, but `MAX_LEASE` lets a community
 pre-pay up to a year per RENEW, so quorum is needed only ~annually.) The only 1-of-m authority that
 ships is **off-chain moderation** (hide/label/ban), which is gossip — a client checks the signer
-against the keyset it verifies off-chain (communities-spec §3), needing **no on-chain cache**.
+against the keyset it verifies off-chain, needing **no on-chain cache**.
 
 **Rule 3 — `vin[0]` MUST sign exactly `SIGHASH_ALL` (`0x01`).** Reject `NONE`, `SINGLE`, every
 `ANYONECANPAY` variant (incl. `0x81`), and any other flag. Only bare `SIGHASH_ALL` commits to
 input *position*; any other flag does not commit to which index the signed input occupies, which
 would let an attacker park the victim's signed input at `vin[1]`, place his own at `vin[0]`, and
 hijack authorship. (A split-key user wanting cold identity + hot funding MUST co-sign the
-finalized input array with `0x01`.)
+finalized input array with `0x01`.) Under `AS` (§3.10, Rule 1b) this binds **every input an `AS`
+marker names**, not only `vin[0]`: each acting input must sign exactly `SIGHASH_ALL`, for the same
+position-and-output commitment that makes its attributed segment unforgeable.
 
 **Wallet note (normative).** Because `vin[0]` signs over the exact input array and outputs, a
 shibpost action cannot be in-place fee-bumped (adding an input or trimming change invalidates the
@@ -966,7 +1101,9 @@ O(1) per action for **P2PKH** (one ECDSA verify); **O(m)** for an m-key **P2SH m
 **Conformance is defined by the shipped test-vector set, not prose** (raw tx hex → `{Identity}`
 or `drop`). It pins DER/low-S, pubkey canonicalization, minimal pushes, the legacy sighash
 **including `FindAndDelete` application**, the P2SH multisig template + scan, the **single-push
-carrier** rule (§1), and the §1 strict-UTF-8 demux. An indexer conforms iff it passes the vectors.
+carrier** rule (§1), the §1 strict-UTF-8 demux, and (Rule 1b) verifying an `AS`-named `vin[k]` by
+these same rules with the per-named-input `SIGHASH_ALL` requirement. An indexer conforms iff it
+passes the vectors.
 
 ---
 
@@ -994,7 +1131,32 @@ carrier** rule (§1), and the §1 strict-UTF-8 demux. An indexer conforms iff it
 chain-anchored identity (address-key-signed, shown as the signer's declared `@handle`) and
 client-side §5 filtering:
 
-- **Handle (display name)** — your public `@name` is an **address-signed declaration**, not chain
+- **Canonical message signing (the off-chain envelope).** Every address-signed off-chain message
+  — handle declarations, reactions, and the RETRACT of §3.8 — uses **one** domain-separated
+  construction, so a wallet's standard *sign-message* facility can author it and no off-chain
+  signature can ever be coerced into meaning an on-chain commitment:
+
+  ```
+  body   = "shibpost/v1\n" ‖ type ‖ "\n" ‖ canonical-fields      # domain-tagged, type-prefixed, plain text
+  digest = SHA256(SHA256("\x19Dogecoin Signed Message:\n" ‖ varint(len(body)) ‖ body))
+  ```
+
+  `digest` is exactly Dogecoin's standard *signed-message* digest — magic length byte `0x19` =
+  `len("Dogecoin Signed Message:\n")` — so a Dogecoin-Core / Ledger `signmessage` over `body`
+  yields a valid shibpost signature, never the bare raw-hash sign that wallets refuse. The
+  `"shibpost/v1\n" ‖ type` tag is the off-chain analogue of the on-chain `0xFF` escape byte: the
+  body is plain text that can never serialize as a transaction sighash (different magic, different
+  shape), and `v1` versions it for forward changes. Identity resolves **exactly as §4**:
+  - **P2PKH author** — one recoverable (BIP-137) signature; identity = `hash160(recovered pubkey)`,
+    honored iff it equals the claimed `author_addr`.
+  - **P2SH-multisig author (a community)** — authorized like the on-chain §4 Rule 2 spend: **m
+    signatures from the recorded redeemScript's keys, in keyset order**, each over the same
+    `digest`, carried with the redeemScript; honored iff `hash160(redeemScript) == author_addr`
+    and all m verify. A single-key envelope **cannot** speak for a multisig identity — this is what
+    lets a community declare a handle or retract a community-authored post. An author whose §4
+    identity is neither shape is **non-attributable off-chain** (as on-chain): unsignable, dropped.
+- **Handle (display name)** — your public `@name` is an **address-signed declaration** (per the
+  canonical envelope above — a community keyset can declare one too), not chain
   state: `{address, display, issued_at}` signed by the address key, honored **iff**
   `lowercase(display)` is a name the address **owns on-chain** (§3) and it is that address's
   **latest** such declaration. Resolution is `address → its latest valid handle`, always rendered
@@ -1007,8 +1169,8 @@ client-side §5 filtering:
 - **Reactions** — handle-signed, TTL'd gossip.
 - **The names orderbook** — asks, bids, and auctions are advisory gossip; the chain only *settles*
   a price gossip discovered (§3.7), via either the open SELL/RESERVE/SETTLE flow or a directed
-  SELLTO/PAY. Clients can run arbitrarily rich markets here; only the final settlement touches the
-  chain. Clients **MUST NOT** surface or originate a SELL/RESERVE/SETTLE/SELLTO/PAY whose spendable
+  SELL_TO/PAY. Clients can run arbitrarily rich markets here; only the final settlement touches the
+  chain. Clients **MUST NOT** surface or originate a SELL/RESERVE/SETTLE/SELL_TO/PAY whose spendable
   outputs (the `pay_leg`, settle remainder, or directed PAY `price`, §3.7) fall below
   the host network's current **relay/dust** policy — such a tx will not relay, so the listing is
   un-executable. The protocol stays agnostic to the (mutable, off-chain) dust limit; the
@@ -1024,24 +1186,30 @@ State is a **deterministic fold** over the canonical chain in strict
 JSON-RPC array position). The scan extends the existing `valid_utf8()` demux:
 
 ```
+actor = vin[0]                                        # per-tx acting identity (Rule 1b); resets each tx
 for each OP_RETURN output o in tx (vout order):       # vout order = intra-tx state-machine order
     payload = the_single_minimal_push(o)              # exactly ONE minimal push, else ⊥ (§1)
     if payload is ⊥:                                        ignore   # multi-push / non-minimal / trailing opcode
-    elif payload starts with 0xFF 'S' 'P' + opcode in 0x01..0x0D:   # contiguous; no reserved holes
-        run §4 stateless verification on vin[0]              # P2PKH O(1) or P2SH multisig O(m)
-        if not verified: drop; continue
-        if opcode in 0x03..0x0D and height < ACTIVATION_HEIGHT: drop; continue   # forward-only gate (§3.0)
+    elif payload starts with 0xFF 'S' 'P' + opcode in 0x01..0x0F:   # contiguous; no reserved holes
+        if opcode in 0x03..0x0F and height < ACTIVATION_HEIGHT: drop; continue   # forward-only gate (§3.0), incl. AS/TRADE
+        if opcode == AS (0x0E):                              # set acting identity (§3.10, Rule 1b)
+            k = payload[4]; flush any pending DECORATE buffer (orphan)
+            actor = (k < n_inputs AND §4-verify(vin[k]) passes AND it signs SIGHASH_ALL) ? vin[k] : ⊥   # ⊥ ⇒ this segment's actions drop until a valid AS / tx-end
+            continue
+        run §4 stateless verification on `actor`             # P2PKH O(1) or P2SH multisig O(m); memoize per distinct input
+        if actor is ⊥ or not verified: drop; continue
         for burn-bearing ops (VOTE/CLAIM/RENEW/RESERVE): check the value field meets the op's requirement
-        dispatch by opcode against current fold state                       # mutates owned set / escrow
+        dispatch by opcode against current fold state, bound to `actor`     # mutates owned set / escrow
         # CLAIM: mints iff name unowned AND a live matching commit in a STRICTLY EARLIER block (commit_height < claim_height, §3.2) sets commit_height — else drop (no FCFS fallback); burn buys ⌊value·LEASE_QUANTUM/(rate·BILLING_UNIT)⌋ days of lease
         # RENEW/TRANSFER/RELEASE: resolve the bitmap against the owned-set + anchor guard (§3.5)
         # RELEASE: selected owned names → pool immediately; immediately reclaimable, like lapse (§3.6)
         # SELL/RESERVE/SETTLE: one name per OP_RETURN (several per tx via multi-OP_RETURN, §3.5); each payment its own exact-value output, consumed once in vout order
         # RESERVE: two-leg deposit spent unconditionally; first-in-chain-order wins the SETTLE option, reserve_expiry = min(now+RESERVE_WINDOW, offer_expiry) (§3.7)
-        # SELLTO: directed offer → lock name (like SELL), record buyer + price + offer_expiry = now+DIRECT_WINDOW; not a set mutation (§3.7)
-        # PAY: honored iff live SELLTO for name AND vin[0]==buyer AND MTP<offer_expiry AND exact-value price→seller present; name→buyer, lease conveys, bump both; no burn (§3.7)
+        # SELL_TO: directed offer → lock name (like SELL), record buyer + price + offer_expiry = now+DIRECT_WINDOW; not a set mutation (§3.7)
+        # PAY: honored iff live SELL_TO for name AND actor==buyer AND MTP<offer_expiry AND exact-value price→seller present; name→buyer, lease conveys, bump both; no burn (§3.7)
+        # TRADE: atomic 1-1 name swap, vin[idxA]/vin[idxB] (both SIGHASH_ALL); names = comma-separated pair nameA,nameB (split on the single 0x2C; comma ∉ §3.1 charset, no length byte); honored iff at confirm vin[idxA] still owns nameA AND vin[idxB] still owns nameB, both unlocked (live-ownership re-check = anti-rug, like SETTLE/PAY — no anchor); whole-op drop on ANY failure (idx OOB, idxA==idxB, not-owned, locked, nameA==nameB, not exactly one comma / bad name §3.1); nameA→vin[idxB], nameB→vin[idxA], leases convey, bumps both mutation heights (§3.10)
         # DECORATE: split into [tag][len:2][value] records (fail-closed on overrun); BUFFER as pending — they bind to the NEXT body below (§1)
-    elif o.value > 0 and len(payload) >= 1 and valid_utf8(payload):  text post — author = §4(vin[0]) or ANONYMOUS; bind pending DECORATE records to it iff that author owns ≥1 name here (§4.1), then clear the buffer
+    elif o.value > 0 and len(payload) >= 1 and valid_utf8(payload):  text post — author = §4(actor) or ANONYMOUS; bind pending DECORATE records to it iff that author owns ≥1 name here (§1), then clear the buffer
     else:                                                       ignore
 # end of tx: any pending DECORATE records with no following body → orphan, discarded (§1)
 ```
@@ -1060,7 +1228,7 @@ author self-deletion is the off-chain RETRACT (§3.8).
 **Time-triggered transitions (no transaction).** Apply as the fold crosses the MTP boundary,
 **before** that block's transactions: a name lapses to the pool at `lease_expiry`; an unsettled
 open listing closes at `offer_expiry` (clears the `listed` flag — the name was always the seller's,
-§3.7); an unpaid **directed offer** (SELLTO) closes at its own `offer_expiry` (clears the `offered`
+§3.7); an unpaid **directed offer** (SELL_TO) closes at its own `offer_expiry` (clears the `offered`
 flag — likewise always the seller's); a lapsed (unsettled) reserve reverts the open listing to its
 pre-reserve state at `reserve_expiry`.
 Because `reserve_expiry` is **clamped to `offer_expiry`** at RESERVE (§3.7), these nest strictly
@@ -1110,7 +1278,7 @@ resulting state or drop`). It pins, at minimum: the commit→claim
 author-binding + commitment-copy case; a claim with no live ≥1-deep commit dropping (no FCFS
 fallback) and a same-block commit being too shallow; the priority tuple; the rent water-fill
 (≥128-bit per-day rescale, fail-closed at `T = 0`, the `T < count` floor, the lexicographic
-remainder, the `MAX_LEASE` redistribution); the renew bitmap ordering and anchor guard, including
+remainder, the `MAX_LEASE` redistribution, and the all-capped `T > 0` remainder forfeited); the renew bitmap ordering and anchor guard, including
 that a **SELL listing does not bump** the mutation height while **SETTLE bumps both** and that an
 **out-of-bounds set bit (index ≥ `K`) is ignored** (in-bounds bits still act, the action is not
 dropped); a
@@ -1119,21 +1287,29 @@ lapsed-reserve revert, a losing reserve's deposit spent yet failing to claim the
 per-tx output matching, the 128-bit deposit math at the near-`2⁶⁴` boundary, and a single MTP
 advance crossing `reserve_expiry`/`offer_expiry`/`lease_expiry` together — applied in
 `reserve → offer → lease` type-order); the SELL price floor `3 × DUST_FLOOR` keeping the settle
-remainder from underflowing; the fee-oracle determinism (the `max(0, coinbase−subsidy)` signed clamp on a miner under-claim,
+remainder from underflowing; the SELL `window` upper bound enforced in add-form (`MTP_now + window
++ REORG_BUFFER ≤ lease_expiry`) so a short-tailed listing is rejected with no unsigned underflow;
+the fee-oracle determinism (the `max(0, coinbase−subsidy)` signed clamp on a miner under-claim,
 floor per-block division, the **odd**-`FEE_WINDOW` single-element median, the exact
 `[h−FEE_WINDOW, h−1]` window, the pinned `block_bytes`/`subsidy`); the MTP window
 pinned to `median(timestamp[H−11 .. H−1])` (a boundary call that flips under an off-by-one window);
 the **DECORATE** binding (TLV framing fail-closed on overrun; records bound to the next body in
-`vout` order; the §4.1 name-ownership gate dropping a nameless author's records; orphan-drop at
-tx-end); the **directed sale** (SELLTO locking the name and not bumping the mutation height; a PAY
+`vout` order; the §1 name-ownership gate dropping a nameless author's records; orphan-drop at
+tx-end); the **directed sale** (SELL_TO locking the name and not bumping the mutation height; a PAY
 from a non-`buyer` `vin[0]` dropping while its exact-value output still pays the seller; a correct
 PAY conveying the name + lease and bumping both sets; a directed `offer_expiry` close clearing an
-unpaid offer; the `DIRECT_WINDOW`+`REORG_BUFFER` lease-tail bound at SELLTO); and lease conveyance
-on TRANSFER/SETTLE/PAY. An indexer conforms iff it passes **both** the §4
-and these fold vectors.
-
-The subprotocol sync messages (`getpostidx` / `getposts`, see network-roadmap.md) carry these op
-types too, not just text posts.
+unpaid offer; the `DIRECT_WINDOW`+`REORG_BUFFER` lease-tail bound at SELL_TO); the **acting identity
+/ `AS`** (a segment re-pointed to `vin[k]`; an out-of-range or non-`SIGHASH_ALL` named input
+dropping its segment, a bare post → anonymous; the funding-input-attribution case; `AS` flushing the
+pending DECORATE buffer); the **atomic `TRADE`** (a 1-1 name swap + lease conveyance
+bumping both mutation heights; the live-ownership anti-rug — a post-sign move/release/sell/lock/lapse
+of either pledged name dropping the *whole* op; **the same-block conflict in both orderings** — a
+TRANSFER of a pledged name ordered *before* the TRADE in the same block drops the TRADE (its later
+ownership check fails), and one ordered *after* also fails (the TRADE already moved the name to the
+counterparty), so neither ordering yields a one-sided outcome; a not-owned / locked / `nameA ==
+nameB` / not-exactly-one-comma case dropping it; several independent 1-1 TRADEs batched in one tx);
+and lease conveyance on TRANSFER/SETTLE/PAY/TRADE. An indexer conforms
+iff it passes **both** the §4 and these fold vectors.
 
 ---
 
@@ -1151,8 +1327,10 @@ types too, not just text posts.
 | SETTLE | 4 + len(name) ≤ 24 | ✅ (one per `OP_RETURN`; several per tx via multi-`OP_RETURN`) |
 | RELEASE | 9 + len(flags) ≤ 80 | ✅ (~568 names/tx) |
 | DECORATE | 4 + Σ records ≤ 80 | ✅ (`[tag][len:2][value]` records; several carriers per tx) |
-| SELLTO | 32 + len(name) ≤ 52 | ✅ (`price`(8) + `buyer`(20) + `name`; fixed window, no field) |
+| SELL_TO | 32 + len(name) ≤ 52 | ✅ (`price`(8) + `buyer`(20) + `name`; fixed window, no field) |
 | PAY | 4 + len(name) ≤ 24 | ✅ (one per `OP_RETURN`; several per tx via multi-`OP_RETURN`) |
+| AS | 5 | ✅ (`[index:1]`; sets acting identity to vin[index], §3.10) |
+| TRADE | 7 + len(A) + len(B) ≤ 47 | ✅ (`[idxA:1][idxB:1]` + `nameA,nameB`; the `,` replaces the length byte; one swap per carrier, several per tx via multi-`OP_RETURN`) |
 
 This budget is the **`OP_RETURN` payload only**, unchanged by P2SH: a multisig `vin[0]`'s
 redeemScript and its `k` signatures ride in the **`scriptSig`** (its own size/relay budget), so
