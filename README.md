@@ -1287,8 +1287,7 @@ lapsed-reserve revert, a losing reserve's deposit spent yet failing to claim the
 per-tx output matching, the 128-bit deposit math at the near-`2⁶⁴` boundary, and a single MTP
 advance crossing `reserve_expiry`/`offer_expiry`/`lease_expiry` together — applied in
 `reserve → offer → lease` type-order); the SELL price floor `3 × DUST_FLOOR` keeping the settle
-remainder from underflowing; the SELL `window` upper bound enforced in add-form (`MTP_now + window
-+ REORG_BUFFER ≤ lease_expiry`) so a short-tailed listing is rejected with no unsigned underflow;
+remainder from underflowing; the SELL `window` upper bound enforced in add-form (`MTP_now + window + REORG_BUFFER ≤ lease_expiry`) so a short-tailed listing is rejected with no unsigned underflow;
 the fee-oracle determinism (the `max(0, coinbase−subsidy)` signed clamp on a miner under-claim,
 floor per-block division, the **odd**-`FEE_WINDOW` single-element median, the exact
 `[h−FEE_WINDOW, h−1]` window, the pinned `block_bytes`/`subsidy`); the MTP window
