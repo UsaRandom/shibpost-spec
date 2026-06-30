@@ -1,4 +1,4 @@
-# shibpost Protocol — Action State Machine (draft)
+# shibpost Protocol — Action State Machine
 
 This document defines the base layer of the shibpost protocol: an identity +
 engagement layer carried in Dogecoin `OP_RETURN` actions.
@@ -71,8 +71,9 @@ retroactive; §3.9).
 
 | constant | value | meaning |
 |----------|-------|---------|
+| `KOINU_PER_DOGE` | `100_000_000` koinu (`= 1` DOGE) | the Dogecoin-standard base unit. Every value/price/burn is carried in **koinu**; the two DOGE-denominated constants below (`RATE_CAP`, the coinbase `subsidy` §3.4) are this many koinu each |
 | `DUST_FLOOR` | `1` koinu | the rent-rate clamp **floor** (§3.4); also the minimum vote weight (§3.8), the RESERVE deposit-leg floor, and the SELL price-floor basis `3 × DUST_FLOOR` (§3.7) |
-| `RATE_CAP` | `1` DOGE | the rent-rate clamp **ceiling** (§3.4) |
+| `RATE_CAP` | `1` DOGE = `100_000_000` koinu | the rent-rate clamp **ceiling** (§3.4) |
 | `REF_SIZE` | `200` bytes | value-agnostic byte count converting fee-per-byte → per-name rent (§3.4) |
 | `FEE_WINDOW` | `10_081` blocks (~1 wk, **odd**) | window for the coinbase fee-per-byte median; **odd** so the median is one selected element — no two-value average, no rounding rule to disagree on (§3.4) |
 | `LEASE_QUANTUM` | `2_419_200` s (~28 d) | the rent rate's anchor — `rate` is koinu per name per `LEASE_QUANTUM`; ~1 DOGE/name/yr at current fees (§3.4) |
@@ -157,14 +158,25 @@ layout     vout0 = DECORATE(s), 0 value   ──directly precede──▶   vout
 ```
 
 The protocol's whole contract here is **framing + binding + authorship, never meaning**: records
-parse deterministically (a `len` overrunning the payload fail-closes the rest of that carrier);
+parse deterministically left→right (a record's `len` overrunning the payload — **or a trailing
+remnant shorter than the 3-byte `[tag:1][len:2]` header**, which cannot begin another record —
+**fail-closes the rest of that carrier**: every record fully parsed before the bad point is kept and
+bound, and only the malformed tail is dropped, never the whole carrier);
 they bind to the body by **co-location + shared `vin[0]`**, *positionally*: a decoration carrier
 **directly precedes** its body in `vout` order (canonically `vout0` = the decoration(s) at `0`
 value, `vout1` = the body at `value > 0`), and the fold — a single forward pass with a small
 pending buffer — binds buffered records to the **next body** it reaches. A `DECORATE` with no body
 following it is an orphan and is dropped; there is no "decorate someone else's post" verb; records
 are §4-attributed exactly like the post they ride on. (Because binding is to the *next* body, one
-tx may carry several decorated posts back-to-back.)
+tx may carry several decorated posts back-to-back.) **Exactly three things clear the pending
+buffer: binding it to a body, an `AS` marker (a new acting identity ends the prior author's
+decorations, §3.10), and end-of-tx (orphan).** An intervening action carrier that is **neither a
+body nor an `AS`** — a VOTE, COMMIT, RENEW, SELL, … sitting between the `DECORATE` and the body —
+does **not** flush the buffer: the records survive it and still bind to the next body. So
+"directly precedes" pins the canonical *layout*, not a strict output-adjacency gate — the binding
+follows the buffer to the next body, not merely the immediately-next output. (An indexer that
+flushed on any intervening carrier would drop decorations a conformant fold keeps — a
+`post_decorations`, hence digest, divergence.)
 The protocol assigns **no** semantics to any `tag`: indexers store records verbatim and **clients
 interpret** (tag meanings are social convention, not protocol — the same maximal-substrate stance
 as votes and reactions). A decoration-unaware reader just sees the plain body; decorations only
@@ -248,9 +260,15 @@ rows. With multi-name, index bloat scales with *users*, not *names*, and the nam
 priority and the rent rate are protocol-fixed, never client policy (§3.9).
 
 **Name validation** (deterministic; invalid → action ignored): canonical charset
-`[a-z0-9_]`, length **1–20** bytes, no structural rules. The canonical key is the lowercase
-form. ASCII-only kills Unicode homoglyphs but not ASCII confusables (`0/o`, `1/l`, `rn/m`),
-so names are **never** trusted as identity on their own (the address fingerprint is, §5).
+`[a-z0-9_]`, length **1–20** bytes, no structural rules. The charset is **already lowercase**
+and there is **no case-folding**: a name is matched byte-for-byte as it appears on the wire,
+and any byte outside `[a-z0-9_]` — an uppercase letter **included** — makes the name invalid,
+so the carrying action is **ignored** (a `CLAIM "Alice"` is dropped, **not** silently
+lower-cased to `alice` and minted). Treating the lowercase as merely *canonical* and folding
+mixed case on the wire would mint names a strict reader rejects — a direct namespace fork — so
+the rule is reject, never fold. ASCII-only kills Unicode homoglyphs but not ASCII confusables
+(`0/o`, `1/l`, `rn/m`), so names are **never** trusted as identity on their own (the address
+fingerprint is, §5).
 
 **Two ways to give up a name — RELEASE (active) and lapse (passive).** Stop renewing and a
 name **lapses** for free when its lease ends — the zero-cost path when you don't care
@@ -274,9 +292,25 @@ nothing.
 `author_hash160` = the committer's `vin[0]` identity (§4). The committed `salt` MUST be the
 **same fixed-width 32 bytes** the matching CLAIM later reveals; that fixed width keeps
 `name`'s length implicit in the CLAIM payload, so the two cannot disagree. The indexer
-records `{commitment, commit_height, tx_index}` and nothing else — a commit mints nothing,
-owns nothing, leaks nothing (the opaque hash reveals neither name nor author). It is live
-for `MTP ∈ [commit_time, commit_time + COMMIT_EXPIRY]` and self-prunes after. Fee-only.
+records `{commitment, commit_height, tx_index, commit_time}` and nothing else — a commit mints
+nothing, owns nothing, leaks nothing (the opaque hash reveals neither name nor author).
+`commit_time` is the **MTP of the commit's confirmation block** (the same MTP clock every other
+wall-clock boundary uses, §0/§8), so the live window is comparable against the MTP the fold
+evaluates at claim time. The commit is live while `MTP ∈ [commit_time, commit_time + COMMIT_EXPIRY]`
+— a **closed** interval (live *through* the endpoint) — and self-prunes once
+`MTP > commit_time + COMMIT_EXPIRY`; this commit window is deliberately **inclusive**, the lone
+exception to the exclusive lease/offer/reserve bounds (§6). Fee-only.
+
+A commit row is pruned **only** by that time bound. A successful CLAIM does **not** consume or
+remove its backing commit — the row **lingers** in the `commits` table until
+`MTP > commit_time + COMMIT_EXPIRY`, exactly as an unused commit would (there is no
+delete-on-use). Lingering is harmless to ownership: a freshly-claimed name stays owned for ≥1
+day, far longer than the ≤5 h commit life, so a left-over commit can never back a second
+successful claim before it self-prunes. It is **not** harmless to the canonical digest: the
+`commits` table is digested, so an indexer that deleted a commit on use would carry a smaller
+`commits` set — and a different state digest — for the ~20–60 blocks the row would otherwise
+still live. Indexers MUST therefore retain a used commit until its time-prune; **delete-on-use
+silently forks the digest**.
 
 The 32-byte salt makes the commitment opaque against brute-force over the small namespace
 (`SHA-256(name)` alone would be brute-forceable). The `author_hash160` term binds the
@@ -298,8 +332,10 @@ cover at least one day (§3.4).
 A name **already owned** → **dropped**. Otherwise the claim mints **iff** a **live** commit
 row exists whose value equals `SHA-256(salt ‖ name ‖ author_hash160)` (author = this claim's
 own `vin[0]`) in a **strictly earlier block** (`commit_height < claim_height`, still within
-`COMMIT_EXPIRY`); the **earliest** such row sets `commit_height`. **No matching ≥1-deep
-commit → the claim is dropped** (no FCFS fallback). A **same-block** commit is too shallow
+`COMMIT_EXPIRY`); among all such rows the backing commit is the one minimizing
+`(commit_height, tx_index)` — that row sets both `commit_height` **and** the `tx_index` the claim
+carries into the tie-break below, single-valued even when one author committed the same name more
+than once. **No matching ≥1-deep commit → the claim is dropped** (no FCFS fallback). A **same-block** commit is too shallow
 and does **not** back a claim.
 
 **Priority — the tuple `(claim_height, commit_height, tx_index)`.** Among competing fresh
@@ -311,8 +347,11 @@ claims for one name the winner minimizes this tuple:
   the name only from your CLAIM can have committed no earlier than your claim's block, so
   their `commit_height ≥ claim_height > your commit_height` and they lose before fee or
   tx-index is consulted. Two honest early committers settle by the earlier `commit_height`.
-- **`tx_index`** is the final tie-break (two genuine same-`commit_height` rushers settle by
-  chain order).
+- **`tx_index`** is the final tie-break, and it is the **commit's** `tx_index` — the position of
+  the backing commit in its block (the commit row is `{commitment, commit_height, tx_index, commit_time}`), **not**
+  the claim's chain order. Two genuine same-`commit_height` rushers settle by whichever *committed*
+  earliest in that block. (Indexers MUST carry the backing commit's `tx_index` into the same-block
+  claim contest; settling such a tie by claim order instead silently forks.)
 
 The mandatory 1-block floor forces a reactive attacker's claim into a strictly later block.
 Beyond it, how much deeper to bury the commit is a **client-side risk choice**: the only
@@ -371,7 +410,7 @@ feesᵢ         = max(0, coinbase_output_totalᵢ − subsidyᵢ)               
 fee_per_byteᵢ = ⌊feesᵢ / block_bytesᵢ⌋                                            # per block, FLOOR division → whole koinu/byte
 rate          = clamp( median(fee_per_byteᵢ for i ∈ [h−FEE_WINDOW, h−1]) × REF_SIZE,
                        DUST_FLOOR, RATE_CAP )                                     # koinu per name·quantum
-# subsidyᵢ = Dogecoin's consensus subsidy at height i (flat 10_000 DOGE across the reachable window); block_bytesᵢ = block tx-data size, AuxPoW header excluded (both pinned below)
+# subsidyᵢ = Dogecoin's consensus subsidy at height i (flat 10_000 DOGE = 1_000_000_000_000 koinu across the reachable window); block_bytesᵢ = block tx-data size, AuxPoW header excluded (both pinned below)
 # FEE_WINDOW is ODD ⇒ median = the single middle element of the sorted window (no two-value average)
 # no duration field — a burn B buys T = ⌊B × LEASE_QUANTUM / (rate × BILLING_UNIT)⌋ name·days, water-filled (§3.5)
 ```
@@ -387,9 +426,14 @@ rate          = clamp( median(fee_per_byteᵢ for i ∈ [h−FEE_WINDOW, h−1])
   variable-subsidy schedule). Because it is the *host's* value, a Dogecoin **emission change** (e.g.
   a block-speed re-scale that drops the per-block reward) is tracked by **following Dogecoin's
   schedule, never a shibpost fork**; a coordinated shibpost-side cutover, if ever wanted, rides a
-  §3.9 activation height. `block_bytesᵢ` is the serialized size of the block's **transaction data**,
-  the **AuxPoW parent-block header data excluded** (Dogecoin is merged-mined; counting the AuxPoW
-  commitment would make "block size" library-dependent) — the blockspace that fees actually pay for.
+  §3.9 activation height. `block_bytesᵢ` is the serialized size of the block's **transaction data** — pinned exactly as
+  **`Σ over the block's transactions of len(raw_tx)`**, the sum of each transaction's own serialized
+  byte length (DOGE has no SegWit, so each `raw_tx` is its single unambiguous legacy serialization).
+  The **80-byte block header, the tx-count varint, and all AuxPoW parent-block header data are
+  excluded** (Dogecoin is merged-mined; counting the header, the count varint, or the AuxPoW
+  commitment would make "block size" library-dependent) — only the blockspace that fees actually pay
+  for is counted. This per-tx-sum definition is consensus-critical: an indexer that instead took
+  "whole-block size minus header" would fold in the tx-count varint and **fork the rate**.
 - **Value-stable** — it tracks real blockspace value, self-adjusting as DOGE moves; no
   governed constant to peg, no oracle to centralize.
 - **Block-speed-invariant** — `fee_per_byte` is a **density**, so a host block-speed change cancels:
@@ -455,10 +499,21 @@ be applied *fully*, never wasted:
 
 So a fee spike neither drops names nor wastes coin: it buys a shorter, evenly-shorter lease
 across the whole batch, and a name that would over-shoot `MAX_LEASE` redirects its rent to
-the names that still need it. This is a deterministic integer computation. The only regime
-where a name still goes unrenewed is `T < count` (funding below even one day per name): the
-first `T` names **in ascending-lexicographic order** (the same ordering the bitmap and the
-remainder step use) get a day and the rest none.
+the names that still need it. This is a deterministic integer computation, and the water-fill
+above is authoritative in **every** regime — underfunding is not a separate rule but the
+`λ = 0` case of the same fill. The only regime where a name still goes unrenewed is when `T` is
+smaller than the number of names that *have* headroom (`hᵢ > 0`) — funding below even one day per
+**eligible** name. There the even level `λ` is `0`, so the whole of `T` falls to the remainder step:
+`+1` **day** to the first `T` headroom-having names in **ascending-lexicographic order** (the same
+ordering the remainder step always uses), and the rest none. A name already at its `MAX_LEASE`
+ceiling (`hᵢ = 0`) is **skipped** — never counted toward this threshold and never awarded a day — so
+its slot flows to the next eligible name exactly as a capped name redistributes in the water-fill
+above. The threshold is the count of **headroom-having** names, **not** the total selected `count`:
+when zero-headroom names pad the batch, a single eligible name can still absorb many days — one name
+with headroom and `T = 50` takes **50** days, not one. (Reading the trigger as a literal `T < count`
+branch that awards one day each would forfeit those days and fork against the water-fill. Skipping a
+zero-headroom name rather than burning a slot on it is consensus-critical: counting it would renew a
+different subset.)
 
 **Payment ops (RESERVE / SETTLE / PAY) are one name per `OP_RETURN`, batched at the *transaction*
 level.** Each carries exactly one listing (name length implicit from the `OP_RETURN`), and
@@ -495,9 +550,16 @@ RENEW all (safe) [0xFF SP 0x05][anchor:5]                = 9 B   same, reject if
 RENEW selective  [0xFF SP 0x05][anchor:5][flags:1..71]   = 10..80 B   ~568 names
 ```
 
-- Bits index your owned-set: all owned names **lexicographically** from bit 0. Bit *i* set ⇒
-  renew that name. Length disambiguates the three modes (`4 / 9 / 10..80`; lengths `5..8`
-  invalid). A holder of ≥569 names cannot selectively address one past bit 567 inside the
+- Bits index your owned-set: all owned names **lexicographically** (unsigned bytewise on the raw
+  name) from bit 0. Bit *i* set ⇒ renew that name, and bit *i* is read **LSB-first within each flag
+  byte** — `bit i = (flags[i >> 3] >> (i & 7)) & 1` — so byte 0's least-significant bit is name 0.
+  The LSB-first mapping is consensus-critical: an MSB-first reader selects a different name for the
+  same flag byte, so every indexer MUST use exactly this bit order. Length disambiguates the three
+  modes (`4 / 9 / 10..80`; lengths `5..8` invalid) — these are **whole-`OP_RETURN` payload** lengths
+  (the 4-byte `0xFF SP 0x05` prefix included). The decoder works in *body* length `bl = len − 4`
+  (`SPEC-conformance.md` §9: `bl ∈ {0, 5} ∪ [6,76]`); the two are the same accept/reject set once the
+  prefix is subtracted, so an impl that read `4 / 9 / 10..80` as *body* lengths would shift the whole
+  band and fork the decoder. A holder of ≥569 names cannot selectively address one past bit 567 inside the
   71-byte flag field — they use renew-all, or wait for the multi-`OP_RETURN` offset byte.
 - **Out-of-bounds bits are ignored, not fatal.** Let `K` be the size of the (anchor-validated)
   owned set. Only bits `0..K−1` are meaningful; **any bit at index ≥ `K` is ignored regardless of
@@ -509,11 +571,28 @@ RENEW selective  [0xFF SP 0x05][anchor:5][flags:1..71]   = 10..80 B   ~568 names
   **before** any bit is interpreted. The same rule governs RELEASE's and TRANSFER's bitmaps — an
   out-of-bounds bit can never erroneously release or transfer a name (there is no name at that
   index), so the anchor guard, not the bounds rule, is what protects the destructive ops.
+- **A locked name selected by a destructive bitmap is skipped, not fatal.** A name currently
+  **listed (SELL) or offered (SELL_TO)** is movement-locked (§3.7) yet keeps its owned-set position
+  (a listing/offer is not a mutation, so it neither bumps the anchor nor renumbers any bit). If a
+  **RELEASE** or **TRANSFER** bitmap selects such a name, that name is **skipped** — the op applies
+  to the selected **unlocked** subset and the locked name stays put, exactly the per-name filter the
+  out-of-bounds rule uses, never a whole-op drop. This preserves the escrow guarantee (a listed name
+  cannot move out from under a buyer) while letting the rest of a batch proceed. **RENEW has no such
+  exception** — a listed/offered name is still renewable (§3.7), so a RENEW bit on it renews
+  normally; a whole-set TRANSFER-all likewise skips any locked name while moving the rest. A
+  RELEASE/TRANSFER that ends up touching **no** name (every selected bit was locked or
+  out-of-bounds) is a **no-op and does not bump** `last_set_mutation_height` — the bump tracks an
+  actual set/ordering change, so an all-skipped op leaves the anchor untouched.
 - The **5-byte absolute height anchor `H`** pins the bitmap's meaning. A per-owner
   `last_set_mutation_height` is bumped on any CLAIM/TRANSFER/RELEASE/SETTLE/PAY/TRADE/lapse touching
-  the set **or its ordering**, for *either* party (SETTLE and PAY both add to the buyer's set and
-  remove from the seller's, and a TRADE moves names both ways between its two parties, so they bump
-  **both**). A SELL **listing** or a SELL_TO **offer** is
+  the set **or its ordering**, for *either* party (a TRANSFER adds the name to the recipient's set
+  and removes it from the sender's, SETTLE and PAY both add to the buyer's set and remove from the
+  seller's, and a TRADE moves names both ways between its two parties, so they all bump
+  **both** parties — only an op that actually moves ≥1 name bumps; an all-skipped/out-of-bounds op
+  bumps neither). A **time-triggered** set change with no native tx — a **lapse** removing a name from
+  its owner's set — stamps that owner's `last_set_mutation_height` to the **connecting block's
+  height `H`** (the block whose pre-block phase applied it, §6); an offer/reserve close leaves the
+  name in the seller's set unchanged and does **not** bump. A SELL **listing** or a SELL_TO **offer** is
   deliberately **not** a mutation: the name stays in the seller's owned set (still renewable,
   §3.7), keeping its bitmap position, so a live RENEW bitmap spanning a listing or offer is
   unaffected. Selective renew is
@@ -521,6 +600,16 @@ RENEW selective  [0xFF SP 0x05][anchor:5][flags:1..71]   = 10..80 B   ~568 names
   If the set has not mutated since `H`, the live lexicographic ordering equals the snapshot
   ordering, so the bits are exact. Worst case under a race is a safe **reject-and-resend**,
   never a wrong-name renewal.
+- **`last_set_mutation_height` is a per-owner monotonic high-water mark — it only ever
+  increases and is *never pruned*.** A would-be stamp lower than the stored value is ignored,
+  and the row is **not** dropped when the owner's live set falls to **empty** (every name
+  lapsed, released, traded, or transferred away). The height persists indefinitely as consensus
+  state — it is part of the canonical digest (§3.9) — so that (a) an owner who re-acquires a
+  name later compares a fresh bitmap against the true high-water mark rather than a reset-to-zero,
+  and (b) two indexers agree on the digest regardless of an owner's set transiently emptying. The
+  "shed the expired live set" allowance (§3.9) covers name/lease rows and transfer history; it
+  does **not** authorize dropping the anchor-guard heights. An indexer that pruned the height row
+  for a now-empty owner would carry a smaller mutation-height set and a **different state digest**.
 - The upper bound `H ≤ confirm` is **fail-closed** and MUST NOT be relaxed forward; clients
   SHOULD anchor a few blocks back (`H = tip − ~6`, well inside `MAX_ANCHOR_AGE`) so
   `confirm ≥ H` survives any shallow reorg and the snapshot sits on already-buried chain.
@@ -563,9 +652,11 @@ Selected names return to the claimable pool **immediately** at this tx's positio
 burned, exactly as on a lapse). A released name is **immediately reclaimable** by a new
 COMMIT/CLAIM, identical to a lapse (§6); a reclaim a later reorg reverses is dropped on
 replay, the same client-side reorg risk as any fresh claim (§3.2). RELEASE touches only names
-you **own and are neither listing nor offering** — a name listed for sale or under a directed
-offer (§3.7) is locked (still owned and renewable, but frozen against RELEASE/TRANSFER/SELL/SELL_TO
-until it settles, is paid, or the listing/offer ends). There is deliberately **no release-all** mode ("abandon everything" is what
+you **own and are neither listing nor offering**: a locked name selected by the bitmap is **skipped**
+(the op releases the selected unlocked subset; the locked name stays put — a per-name filter, never
+a whole-op drop, §3.5). A name listed for sale or under a directed offer (§3.7) is locked (still
+owned and renewable, but frozen against RELEASE/TRANSFER/SELL/SELL_TO until it settles, is paid, or
+the listing/offer ends). There is deliberately **no release-all** mode ("abandon everything" is what
 lapse already does for free); RELEASE is the *selective, now* tool (~568 names/tx), and the
 wrong-name footgun is caught by the anchor guard.
 
@@ -584,8 +675,10 @@ The two design pillars:
   name stays in the seller's owned set and **stays renewable** — keeping the lease alive only
   benefits the eventual buyer; only *movement* is frozen.) This closes the co-sign-swap front-run:
   a seller can't grant the name in a co-signed tx and simultaneously transfer it away using a
-  different UTXO, because TRANSFER on a listed name is **rejected** for the listing's life. (A
-  directed SELL_TO offer locks the name identically — see *Directed sales* below.)
+  different UTXO, because the listed name is **frozen against movement** for the listing's life — a
+  TRANSFER or RELEASE bitmap that selects it **skips** it (the rest of the batch still applies, §3.5),
+  so it can never leave the seller's set while listed. (A directed SELL_TO offer locks the name
+  identically — see *Directed sales* below.)
 - **Fixed price** — the price is committed on-chain at SELL, immutable. This closes the
   dynamic-price front-run: with nothing to infer at reserve time, a seller can't self-reserve
   at a cheap inferred price. The escrow is what makes publishing a fixed price safe (without
@@ -618,8 +711,11 @@ warn, §5).
   listable iff it has at least `RESERVE_WINDOW + REORG_BUFFER` of lease left. This pins
   `offer_expiry = MTP_now + window ≤ lease_expiry − REORG_BUFFER`, so the name can never lapse to
   the pool while a sale is live (the "pay for an already-free name" trap is structurally
-  impossible, with reorg slack). `window = 0` defaults to `RESERVE_WINDOW`; out of range →
-  ignored.
+  impossible, with reorg slack). `window = 0` defaults to `RESERVE_WINDOW`; any **nonzero**
+  window is taken literally and checked against both bounds — a window in the `[1, RESERVE_WINDOW)`
+  band (nonzero but below the floor), or one exceeding the lease-tail add-form bound, is **out of
+  range → the SELL is ignored** (only `0`, meaning "use the floor", and values `≥ RESERVE_WINDOW`
+  within the lease tail are accepted).
 - A listing's `price` is fixed koinu and cannot be repriced in place; to re-price, the seller
   reclaims it (self-buy, ~0.5 %) and re-SELLs at the new price. Clients MUST disclose the
   chosen expiry and that the price is fixed for the listing's life (repricing costs a ~0.5 %
@@ -644,6 +740,19 @@ exact-value output** (matched per the `vout`-order consume-once rule of §3.5). 
 be computed in **≥128-bit**: `price × bps` overflows `int64`, and `price` is an attacker-typed
 field in a SELL payload (free to inflate near `2⁶⁴`), so a 64-bit indexer would wrap to a
 near-zero deposit.
+
+**"Settle unconditionally" means the deposit is *non-refundable once the RESERVE is valid* — it
+does *not* mean the RESERVE applies without its payment.** The `pay_leg` output to the seller
+MUST be **present and matched** (the `vout`-order consume-once exact-value rule of §3.5), and the
+carrier value MUST be `≥ burn_leg`. A RESERVE whose `pay_leg` output is **absent**, or whose
+carrier value is short of `burn_leg`, **drops** and claims **no** option (the listing stays OPEN).
+The "unconditional" is purely that a *valid, confirmed* reserve's two legs cannot be clawed back —
+the indexer holds no custody and cannot un-burn a confirmed output — never a licence to apply a
+reserve with no matching output. The same output-required rule governs the rest of the chain:
+**SETTLE** drops without its remainder output to the seller, and **PAY** drops without its
+full-price output (both per §3.5's "if none remains, that op drops"). Reading "unconditionally"
+as "apply even with no payment output" flips a RESERVE/SETTLE/PAY from drop → apply — an
+ownership/escrow fork.
 
 - **First-in-chain-order wins the option.** Among reserves for one name the lowest
   `(height, tx_index)` becomes the **exclusive** buyer — the only address that may SETTLE —
@@ -832,9 +941,19 @@ Identity cannot use client policy: any ownership-determining threshold MUST be p
 so every indexer resolves the same owner. Contests are broken by the deterministic priority
 tuple (§3.2), never by burn-as-tiebreak.
 
+**Canonical state serialization is pinned, not prose.** Two indexers "agree" iff they hash the live
+set to the same digest, which requires a byte-exact canonical layout (owned-set rows sorted by name;
+the field order; which fields are canonical — e.g. a row's `seller_type` is consensus state but a
+plain owner's `owner_type` is not, since a gift's type is cosmetic). This prose fixes *what* is
+shared state; the exact serialization is pinned by the cross-language reference state machine and its
+conformance contract (the seed-regenerated digest vectors), the same way §3.10's wallet previews and
+§4's attribution are pinned by vector sets rather than English.
+
 **Storage is economically bounded.** The only state an indexer MUST keep is the *live* set —
-who owns which name, each lease, live commits, and open sale data; expired names and transfer
-history are sheddable. The spammable surface (a victim's owned set) is itself **rented**: every
+who owns which name, each lease, live commits, open sale data, **and the per-owner
+`last_set_mutation_height` anchor-guard heights** (a monotonic high-water mark, retained even
+for an owner whose set is momentarily empty, §3.5); expired names and transfer history are
+sheddable, but the anchor heights are **not** — they are consensus state and enter the digest. The spammable surface (a victim's owned set) is itself **rented**: every
 name persists only as long as its lease is paid (§3.4), and a name enters anyone's set only by
 being minted/conveyed, which cost the minter rent ∝ duration. Abandoned/spam rows shed at
 `lease_expiry` (a sliding window bounded above by `MAX_LEASE`), and keeping them alive costs the
@@ -896,6 +1015,12 @@ SELL/SELL_TO/RESERVE/SETTLE/PAY name a single name (a 1-1 swap is a single-name 
 applies in full or **drops in full** — there is no partial or one-sided trade. Both parties MUST
 pass §4 + sign `SIGHASH_ALL`; it bumps **both** parties' `last_set_mutation_height` (§3.5), so any
 RENEW/RELEASE/TRANSFER bitmap either party has in flight registers the moved name. Fee-only.
+TRADE is attributed **solely** to `vin[idxA]`/`vin[idxB]`; it does **not** consult the
+transaction's acting identity (the `vin[0]`/`AS` actor every *other* op acts as, §6). So a TRADE
+settles on the validity of its two named parties **alone** — it still applies in a tx whose acting
+identity is ⊥, and conversely a valid acting identity never stands in for a failed party. (A
+reading that required the carrier's acting identity to verify before a TRADE could apply would
+**drop** trades a conformant fold settles — an ownership fork.)
 
 - **Atomicity *and* anti-rug come free from the live-ownership re-check.** Validity is re-evaluated
   at the swap's **confirmation** position in the fold (§6): `vin[idxA]` must **still own `nameA`**
@@ -1077,13 +1202,28 @@ one key are **different** identities. Non-canonical → drop. Implementations MU
    Everything that keys on a party uses this bare hash (type-agnostic); reconstruction sites that
    rebuild a `scriptPubKey` (the SELL `seller` check, a SETTLE owner-write) carry the recorded
    script type, P2PKH or P2SH (Rule 2).
-4. **Reconstruct scriptCode & verify ECDSA locally:** for **P2PKH**, scriptCode =
+4. **Reconstruct scriptCode & verify ECDSA locally:** for **P2PKH**, the `pubkey` must be
+   **on-curve** first (Rule 4 — the *same* gate applied to the multisig keys below; a P2PKH pubkey
+   that is canonically *encoded* but off-curve drops at the **on-curve** gate — never an encoding
+   (classify) failure and never a verify failure, i.e. the §13 **on-curve-drop** status (carrying
+   its real identity + sighash, exactly like an off-curve redeemScript key)), then scriptCode =
    `OP_DUP OP_HASH160 <Identity> OP_EQUALVERIFY OP_CHECKSIG` and one `Verify(sig, pubkey, sighash)`.
    For **P2SH multisig**, scriptCode = the **redeemScript** itself, and the `m` sigs are checked
    against the `n` pubkeys by the in-order scan (Rule 2) — each sig against the next matching
    pubkey, advancing the pubkey cursor on a miss — until all `m` verify (pass) or the pubkeys
-   exhaust (drop). Compute the **legacy** sighash from the raw tx + scriptCode + type `0x01`
-   (legacy needs no input amount — what makes this stateless; DOGE has no SegWit). When building
+   exhaust (drop). **On-curve is validated on all `n` redeemScript keys up front** (Rule 4) — each a
+   33-byte `0x02`/`0x03` compressed key with `X < p` **and on the curve**; a redeemScript carrying
+   **any** off-curve key is rejected as non-canonical (drop), because the identity's key set is a
+   property of the **redeemScript alone**, independent of which sigs are presented — checking every
+   key up front keeps attribution deterministic and order-free, so an off-curve key can never
+   silently change which identity a spend attributes to. Compute the **legacy** sighash from the raw tx + scriptCode + type `0x01`
+   (legacy needs no input amount — what makes this stateless; DOGE has no SegWit) — Dogecoin's
+   standard pre-SegWit sighash **exactly as host consensus computes it**: serialize the tx with the
+   input being signed carrying `scriptCode` as its `scriptSig` and every other input an empty
+   script, then append the hashtype as a **4-byte little-endian `int32` (`0x01 0x00 0x00 0x00`)**
+   before the double-SHA-256 — **never** a 1-byte suffix. The append width is consensus-critical (a
+   1- vs 4-byte hashtype changes every input's sighash and flips attribution); the 4-byte LE form is
+   the host-consensus standard this rule defers to. When building
    that sighash, indexers **MUST apply Dogecoin's `FindAndDelete(scriptCode, sigPush)` for each
    checked signature exactly as host consensus does — never skip it as an assumed no-op.** For
    P2PKH the scriptCode holds only a hash, so there is nothing to find. For the rigid
@@ -1196,9 +1336,11 @@ for each OP_RETURN output o in tx (vout order):       # vout order = intra-tx st
             k = payload[4]; flush any pending DECORATE buffer (orphan)
             actor = (k < n_inputs AND §4-verify(vin[k]) passes AND it signs SIGHASH_ALL) ? vin[k] : ⊥   # ⊥ ⇒ this segment's actions drop until a valid AS / tx-end
             continue
+        if opcode == TRADE (0x0F):                           # attributed to its OWN named inputs vin[idxA]/vin[idxB], NOT the acting identity (§3.10)
+            dispatch TRADE (each party §4-verified + SIGHASH_ALL); it NEVER consults `actor`, so the acting-identity gate below does NOT apply — a TRADE in a tx whose vin[0]/AS actor is ⊥ still settles if both named parties are valid; continue
         run §4 stateless verification on `actor`             # P2PKH O(1) or P2SH multisig O(m); memoize per distinct input
-        if actor is ⊥ or not verified: drop; continue
-        for burn-bearing ops (VOTE/CLAIM/RENEW/RESERVE): check the value field meets the op's requirement
+        if actor is ⊥ or not verified: drop; continue        # (TRADE already handled above — every OTHER op acts as the acting identity)
+        for burn-bearing ops check the value field meets the op's requirement — VOTE: value ≥ DUST_FLOOR; CLAIM/RENEW: the buy must cover ≥1 name·day (T ≥ 1, water-fill fail-closed at T=0, §3.5); RESERVE: carrier value ≥ burn_leg (§3.7)
         dispatch by opcode against current fold state, bound to `actor`     # mutates owned set / escrow
         # CLAIM: mints iff name unowned AND a live matching commit in a STRICTLY EARLIER block (commit_height < claim_height, §3.2) sets commit_height — else drop (no FCFS fallback); burn buys ⌊value·LEASE_QUANTUM/(rate·BILLING_UNIT)⌋ days of lease
         # RENEW/TRANSFER/RELEASE: resolve the bitmap against the owned-set + anchor guard (§3.5)
@@ -1220,7 +1362,8 @@ past finality). `names` (the owned-set store — a row per `(name, owner)` with 
 `offer_expiry`, and reservation fields `reserver`, `reserve_expiry`; a **directed-offered** name
 instead carries an `offered` flag plus `buyer`, `price`, `seller` (hash160 + script type), and
 `offer_expiry` — no reservation fields, since the named buyer is the only completer). `commits` (per
-`{commitment, commit_height, tx_index}`, pruned at `COMMIT_EXPIRY`). Per-owner
+`{commitment, commit_height, tx_index, commit_time}`, `commit_time` = MTP of the commit block,
+pruned once `MTP > commit_time + COMMIT_EXPIRY`, §3.2). Per-owner
 `last_set_mutation_height` for the renew anchor guard (§3.5). `post_decorations` (records bound to a post's `(txid, vout)`,
 stored **verbatim** and served, never interpreted, §1). There is **no** `purged` table —
 author self-deletion is the off-chain RETRACT (§3.8).
@@ -1230,7 +1373,9 @@ author self-deletion is the off-chain RETRACT (§3.8).
 open listing closes at `offer_expiry` (clears the `listed` flag — the name was always the seller's,
 §3.7); an unpaid **directed offer** (SELL_TO) closes at its own `offer_expiry` (clears the `offered`
 flag — likewise always the seller's); a lapsed (unsettled) reserve reverts the open listing to its
-pre-reserve state at `reserve_expiry`.
+pre-reserve state at `reserve_expiry`. A **lapse** removes a name from its owner's set, so it stamps
+that owner's `last_set_mutation_height` to the **connecting height `H`** (§3.5); the offer/reserve
+closes leave the name in the seller's set unchanged and do **not** bump.
 Because `reserve_expiry` is **clamped to `offer_expiry`** at RESERVE (§3.7), these nest strictly
 — `reserve_expiry ≤ offer_expiry ≤ lease_expiry − REORG_BUFFER < lease_expiry` — so MTP
 monotonicity crosses them in order regardless of reorgs (the `REORG_BUFFER` gap is a *relative*
@@ -1252,8 +1397,11 @@ by sorting boundary values) is required because the values can tie — the RESER
 already holds. This ordering matters only **within a single name's** reserve→offer→lease chain;
 distinct names are independent, and `COMMIT_EXPIRY` pruning is independent of this chain (it must
 only, like the rest, precede the block's txs).
-`lease_expiry` / `offer_expiry` / `reserve_expiry` are **exclusive** bounds. Resolving ownership
-*lazily* (testing `MTP < lease_expiry` only at query time) is **forbidden** — a same-block
+`lease_expiry` / `offer_expiry` / `reserve_expiry` are **exclusive** bounds (owned iff
+`MTP < lease_expiry`). The **`COMMIT_EXPIRY` window is the lone exception — it is *inclusive*** (a
+commit is live *through* `commit_time + COMMIT_EXPIRY` and pruned only once `MTP` strictly exceeds
+it, §3.2), because it gates a one-shot prune, not the nested lease/offer/reserve chain. Resolving
+ownership *lazily* (testing `MTP < lease_expiry` only at query time) is **forbidden** — a same-block
 lapse-and-reclaim MUST apply the lapse before the reclaiming tx in the same block.
 
 **MTP (exact window — consensus-critical).** When connecting the block at height `H`, evaluate
@@ -1262,6 +1410,13 @@ lapse-and-reclaim MUST apply the lapse before the reclaiming tx in the same bloc
 timestamps of the **11 blocks strictly before `H`**, with block `H`'s own timestamp **excluded**.
 This is exactly Dogecoin's `GetMedianTimePast()` of `H`'s parent — the BIP113 lock-time convention
 — so the indexer evaluates a boundary against the very value the host chain used to validate `H`.
+**Short window / genesis (pinned):** when fewer than 11 blocks precede `H` (reachable only near
+genesis or a low `ACTIVATION_HEIGHT`), take the median over the `k = min(11, H)` available
+predecessors — sort them and select index `⌊k/2⌋`, the **upper**-middle for an even `k`, **never**
+a two-value average — exactly `GetMedianTimePast()`'s own short-window behavior; and `MTP(0) = 0`
+(no predecessors). This must be pinned because the abstract state machine can run from height 0,
+where a reader that averaged an even window, took the lower-middle, or left `MTP(0)` undefined
+would compute a different boundary and fork an early lapse/settle.
 Pinning the index range is consensus-critical: an off-by-one window (including `H`, or sliding to
 `[H−10 .. H]`) shifts MTP by up to a block and can flip a single boundary call — one indexer
 dropping a SETTLE while another transfers ownership. MTP is a pure function of headers
@@ -1277,7 +1432,7 @@ final.
 resulting state or drop`). It pins, at minimum: the commit→claim
 author-binding + commitment-copy case; a claim with no live ≥1-deep commit dropping (no FCFS
 fallback) and a same-block commit being too shallow; the priority tuple; the rent water-fill
-(≥128-bit per-day rescale, fail-closed at `T = 0`, the `T < count` floor, the lexicographic
+(≥128-bit per-day rescale, fail-closed at `T = 0`, the `λ = 0` underfunding floor — one day each to the first `T` *headroom-having* names, not a `T < count` branch, the lexicographic
 remainder, the `MAX_LEASE` redistribution, and the all-capped `T > 0` remainder forfeited); the renew bitmap ordering and anchor guard, including
 that a **SELL listing does not bump** the mutation height while **SETTLE bumps both** and that an
 **out-of-bounds set bit (index ≥ `K`) is ignored** (in-bounds bits still act, the action is not
@@ -1320,7 +1475,7 @@ iff it passes **both** the §4 and these fold vectors.
 | COMMIT | 36 | ✅ |
 | CLAIM | 36 + len(name) ≤ 56 | ✅ (32-byte salt) |
 | RENEW (all / safe / selective) | 4 / 9 / 10..80 | ✅ (~568 selective names) |
-| TRANSFER (all / selective) | 24 / 29..80 | ✅ (~400 names/target) |
+| TRANSFER (all / selective) | 24 / 30..80 | ✅ (~400 names/target) |
 | SELL | 16 + len(name) ≤ 36 | ✅ |
 | RESERVE | 4 + len(name) ≤ 24 | ✅ (one per `OP_RETURN`; several per tx via multi-`OP_RETURN`) |
 | SETTLE | 4 + len(name) ≤ 24 | ✅ (one per `OP_RETURN`; several per tx via multi-`OP_RETURN`) |
